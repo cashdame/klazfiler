@@ -6,33 +6,32 @@ import time
 import random
 import logging
 import urllib.parse
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import requests
 from aiogram import types
-from aiogram.dispatcher import FSMContext
 
 logger = logging.getLogger("klazfiler.quickpost")
 
-# ===== Env / Config =====
+# ==== ENV ====
 SUITEPRO_API_KEY = os.getenv("SUITEPRO_API_KEY", "")
 SUITEPRO_API_URL = os.getenv("SUITEPRO_API_URL", "https://api.suitepro.to").rstrip("/")
 SUITEPRO_CATEGORIES_URL = os.getenv("SUITEPRO_CATEGORIES_URL", f"{SUITEPRO_API_URL}/categories")
 SUITEPRO_METADATA_URL = os.getenv("SUITEPRO_METADATA_URL", f"{SUITEPRO_API_URL}/metadata")
-SUITEPRO_ACCOUNTS_URL = f"{SUITEPRO_API_URL}/accounts/?search=&loginStatus=all&cursor=0&limit=100&sortBy=creationDate&sortOrder=desc"
-SUITEPRO_CLASSIFIEDS_URL = os.getenv("SUITEPRO_CLASSIFIEDS_URL", f"{SUITEPRO_API_URL}/classifieds/")
+SUITEPRO_CLASSIFIEDS_URL = os.getenv("SUITEPRO_CLASSIFIEDS_URL", f"{SUITEPRO_API_URL}/classifieds")
 
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # у тебя так в .env
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 API_TIMEOUT = int(os.getenv("API_TIMEOUT", "120"))
 API_RETRIES = int(os.getenv("API_RETRIES", "3"))
 
-# правила разброса цены как в пасте
+# диапазон цен по-умолчанию
 MIN_PRICE = int(os.getenv("WARMUP_MIN_PRICE", "10"))
 MAX_PRICE = int(os.getenv("WARMUP_MAX_PRICE", "25"))
 
-CATEGORY_STRATEGY = os.getenv("CATEGORY_STRATEGY", "random")  # random|cycle|fixed
+CATEGORY_STRATEGY = os.getenv("CATEGORY_STRATEGY", "random")  # random|fixed
 FIXED_CATEGORY_ID = os.getenv("CATEGORY_ID", "")
 
 HEADERS_SUITE = {
@@ -46,38 +45,37 @@ HEADERS_OPENAI = {
     "Content-Type": "application/json",
 }
 
+# ==== HTTP ====
+
 def _req_with_retry(method: str, url: str, **kw) -> requests.Response:
     delay = 1.0
-    last_exc = None
     for attempt in range(1, API_RETRIES + 1):
         try:
-            resp = requests.request(method, url, timeout=API_TIMEOUT, **kw)
-            if resp.status_code in (429, 500, 502, 503, 504) and attempt < API_RETRIES:
-                logger.info(f"[QuickPost] retry {url} ({resp.status_code}) after {delay:.1f}s")
+            r = requests.request(method, url, timeout=API_TIMEOUT, **kw)
+            # если это 401 — сразу выходим, ретраи бессмысленны
+            if r.status_code == 401:
+                r.raise_for_status()
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < API_RETRIES:
+                logger.info(f"[QuickPost] retry {url} ({r.status_code}) after {delay:.1f}s")
                 time.sleep(delay)
                 delay = min(delay * 2, 10)
                 continue
-            resp.raise_for_status()
-            return resp
+            r.raise_for_status()
+            return r
         except requests.RequestException as e:
-            last_exc = e
             if attempt < API_RETRIES:
                 logger.info(f"[QuickPost] retry {url} after error: {e}; sleep {delay:.1f}s")
                 time.sleep(delay)
                 delay = min(delay * 2, 10)
             else:
                 raise
-    # чтобы mypy не ругался
-    assert last_exc
-    raise last_exc
 
-# ===== SuitePro helpers =====
+# ==== SuitePro helpers ====
 
 def fetch_accounts() -> List[Dict]:
     r = _req_with_retry("GET", SUITEPRO_ACCOUNTS_URL, headers=HEADERS_SUITE)
     data = r.json() if r.text else {}
-    accounts = data.get("accounts", []) if isinstance(data, dict) else []
-    return accounts
+    return data.get("accounts", []) if isinstance(data, dict) else []
 
 def filter_accounts_no_ads(accounts: List[Dict]) -> List[Dict]:
     out = []
@@ -103,9 +101,9 @@ def fetch_category_map_leaf_only() -> Dict[str, str]:
         fake_flag = node.get("has-fake-sub-category", {})
         fake_val = fake_flag.get("value") if isinstance(fake_flag, dict) else None
         if isinstance(cat_list, list) and len(cat_list) == 0:
-            return (fake_val is None or str(fake_val) == "false")
+            return (fake_val is None or str(fake_val).lower() == "false")
         if "category" not in node and "id" in node and "localized-name" in node:
-            return (fake_val is None or str(fake_val) == "false")
+            return (fake_val is None or str(fake_val).lower() == "false")
         return False
 
     def add_if_leaf(node: Dict):
@@ -192,16 +190,18 @@ def extract_attribute_schema(meta_payload: Dict) -> List[Dict]:
             })
     return schema
 
-# ===== OpenAI =====
+# ==== OpenAI ====
 
 def oa_chat_json(messages: List[Dict]) -> Dict:
+    if not OPENAI_API_KEY:
+        return {}
     url = OPENAI_API_BASE.rstrip("/") + "/v1/chat/completions"
     payload = {
         "model": OPENAI_MODEL,
         "response_format": {"type": "json_object"},
         "messages": messages,
     }
-    r = _req_with_retry("POST", url, headers=HEADERS_OPENAI, json=payload)
+    r = _req_with_retry("POST", url, headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}, json=payload)
     data = r.json()
     try:
         content = data["choices"][0]["message"]["content"]
@@ -232,10 +232,10 @@ def build_ad_payload(category_id: str, category_name: str, banned_brands: List[s
             ),
         },
     ]
-    return oa_chat_json(messages) if OPENAI_API_KEY else {}
+    return oa_chat_json(messages)
 
 def build_attributes_payload(ad_obj: Dict, attr_schema: List[Dict]) -> Dict:
-    if not attr_schema:
+    if not attr_schema or not OPENAI_API_KEY:
         return {}
     schema_json = json.dumps(attr_schema, ensure_ascii=False)
     ad_json = json.dumps(ad_obj, ensure_ascii=False)
@@ -254,16 +254,14 @@ def build_attributes_payload(ad_obj: Dict, attr_schema: List[Dict]) -> Dict:
             "content": f"SCHEMA: {schema_json}\nAD: {ad_json}",
         },
     ]
-    return oa_chat_json(messages) if OPENAI_API_KEY else {}
+    return oa_chat_json(messages)
 
-# ===== Telegram handler =====
+# ==== Telegram handler ====
 
-# точка входа из меню
-async def quickpost_entry(message: types.Message, state: FSMContext):
-    await state.finish()
+async def quickpost_entry(message: types.Message):
     await message.answer("⚡ Быстрая публикация: запускаю…")
 
-    # 1) получаем аккаунты
+    # 1) аккаунт
     logger.info("[QuickPost] fetch accounts…")
     try:
         accounts = fetch_accounts()
@@ -274,10 +272,9 @@ async def quickpost_entry(message: types.Message, state: FSMContext):
         return
 
     if not candidates:
-        await message.answer("Нет подходящих аккаунтов: нужно, чтобы был логин, верификация и 0 объявлений.")
+        await message.answer("Нет подходящих аккаунтов: нужен логин, верификация и 0 объявлений.")
         return
 
-    # просто берём один (быстрое разогревочное)
     acc = random.choice(candidates)
     email = acc.get("email") or acc.get("username") or acc.get("id", "unknown")
     logger.info(f"[QuickPost] picked account: {email}")
@@ -290,7 +287,6 @@ async def quickpost_entry(message: types.Message, state: FSMContext):
         await message.answer("Не смог получить категории.")
         return
 
-    # выбор категории
     ids = sorted(cmap.keys())
     if CATEGORY_STRATEGY == "fixed" and FIXED_CATEGORY_ID in cmap:
         cat_id = FIXED_CATEGORY_ID
@@ -298,16 +294,15 @@ async def quickpost_entry(message: types.Message, state: FSMContext):
         cat_id = random.choice(ids)
     cat_name = cmap.get(cat_id, "Kategorie")
 
-    # 3) метаданные и схема атрибутов
+    # 3) метаданные/атрибуты
     meta = fetch_category_metadata(cat_id)
     schema = extract_attribute_schema(meta)
 
-    # 4) запрет брендов (простая память на время процесса)
+    # 4) запрещённые бренды (в простом виде — пусто)
     banned = []
 
-    # 5) генерим объявление
-    ad_obj = build_ad_payload(cat_id, cat_name, banned) or {}
-    # фолбэк если OAI нет/упал
+    # 5) генерим карточку
+    ad_obj = build_ad_payload(cat_id, cat_name, banned)
     if not ad_obj or ad_obj.get("category_id") != cat_id:
         price = random.randint(MIN_PRICE, MAX_PRICE)
         ad_obj = {
@@ -318,21 +313,21 @@ async def quickpost_entry(message: types.Message, state: FSMContext):
             "category_id": cat_id,
         }
 
-    # 6) атрибуты, если есть схема
+    # 6) атрибуты
     attrs = build_attributes_payload(ad_obj, schema) if schema else {}
+    if not isinstance(attrs, dict):
+        attrs = {}
 
-    # 7) собираем payload для SuitePro
+    # 7) финальный payload
     payload = {
         "categoryId": ad_obj["category_id"],
         "title": ad_obj["title"],
         "description": ad_obj["description"],
         "price": int(ad_obj["price"]),
-        "attributes": attrs if isinstance(attrs, dict) else {},
-        # картинки не загружаем в этой «быстрой» версии
-        "images": [],
+        "attributes": attrs,
+        "images": [],  # для «быстрой» версии без картинок
     }
 
-    # 8) POST /classifieds/
     try:
         logger.info(f"[QuickPost] POST {SUITEPRO_CLASSIFIEDS_URL} json={json.dumps(payload, ensure_ascii=False)[:600]}")
         r = _req_with_retry("POST", SUITEPRO_CLASSIFIEDS_URL, headers=HEADERS_SUITE, json=payload)

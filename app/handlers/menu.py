@@ -1,35 +1,46 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import logging
-from aiogram import types, Dispatcher
-from aiogram.dispatcher import FSMContext
+from aiogram import Router, F, types
 
 from app.keyboards import main_keyboard
-from app.handlers.quick_post import quickpost_entry
+# если у тебя есть модуль быстропоста — импортируем точку входа
+try:
+    from app.handlers.quick_post import quickpost_entry
+except Exception:
+    quickpost_entry = None  # переживём временно
 
 logger = logging.getLogger("klazfiler.menu")
 
-# Тексты кнопок из твоего keyboards.py
-BTN_QUICKPOST = "⚡ Быстрая публикация"
-BTN_GRABBER = "📥 Grabber"
-BTN_ARCHIVE = "🗂 Архив товаров"
-BTN_ADDACC = "➕ Добавить аккаунт"
-BTN_LISTACC = "👥 Список аккаунтов"
-BTN_REG = "📝 Регистрация"
-BTN_BACK = "⬅️ Назад"
-BTN_FILTERS = "⚙️ Фильтры"
-BTN_123 = "🔢 123"
+# aiogram v3: нужен Router
+router = Router(name="menu")
 
-async def cmd_start(message: types.Message, state: FSMContext):
-    if state:
-        await state.finish()
+# Тексты кнопок (держим здесь, чтобы не трогать keyboards.py)
+BTN_QUICKPOST = "⚡ Быстрая публикация"
+BTN_GRABBER   = "📥 Grabber"
+BTN_ARCHIVE   = "🗂 Архив товаров"
+BTN_ADDACC    = "➕ Добавить аккаунт"
+BTN_LISTACC   = "👥 Список аккаунтов"
+BTN_REG       = "📝 Регистрация"
+BTN_BACK      = "⬅️ Назад"
+BTN_FILTERS   = "⚙️ Фильтры"
+BTN_123       = "🔢 123"
+
+# /start и /menu
+@router.message(F.text.as_("text") & (F.text == "/start") | (F.text == "/menu"))
+async def cmd_start(message: types.Message, text: str):
     await message.answer("Меню:", reply_markup=main_keyboard())
 
-async def on_menu_message(message: types.Message, state: FSMContext):
+# Обработка нажатий по тексту кнопок
+@router.message(F.text)
+async def on_menu_message(message: types.Message):
     txt = (message.text or "").strip()
 
     if txt == BTN_QUICKPOST:
-        await quickpost_entry(message, state)
+        if quickpost_entry is None:
+            await message.answer("Быстрая публикация пока недоступна (модуль не найден).")
+            return
+        await quickpost_entry(message)
         return
 
     if txt == BTN_GRABBER:
@@ -49,16 +60,12 @@ async def on_menu_message(message: types.Message, state: FSMContext):
         return
 
     if txt == BTN_REG:
-        await message.answer("Регистрация (пока заглушка, у тебя уже есть отдельный модуль).")
+        await message.answer("Регистрация — у тебя есть отдельный модуль. Откроем оттуда.")
         return
 
     if txt in (BTN_BACK, BTN_FILTERS, BTN_123):
         await message.answer("Ок", reply_markup=main_keyboard())
         return
 
-    # если что-то непонятное — просто вернём меню
+    # если пришло что-то постороннее — просто покажем меню
     await message.answer("Не понял. Давай так:", reply_markup=main_keyboard())
-
-def setup_menu(dp: Dispatcher):
-    dp.register_message_handler(cmd_start, commands=["start", "menu"])
-    dp.register_message_handler(on_menu_message, content_types=types.ContentTypes.TEXT)
