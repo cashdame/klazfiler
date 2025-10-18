@@ -1,23 +1,22 @@
+# app/tools/registration_bot.py
 import asyncio
 import time
 import random
 import string
 import re
 import json
-import logging
 import os
-import threading
-import subprocess
 import ssl
 import imaplib
+import subprocess
 import email
+import threading
 import socks
-import socket as original_socket
 from email.header import decode_header
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Set, Tuple, Awaitable, Callable
 from dataclasses import dataclass
-from contextlib import contextmanager
 
 from app.config import settings
 from app.logging_setup import get_logger
@@ -25,7 +24,7 @@ from app.logging_setup import get_logger
 log = get_logger("klazfiler.registration")
 
 # === Настройки ===
-API_BASE_URL = settings.SUITEPRO_API_URL.rstrip("/")
+API_BASE_URL = (settings.SUITEPRO_API_URL or "https://api.suitepro.to").rstrip("/")
 SMS_ACTIVATE_API_BASE_URL = settings.SMS_ACTIVATE_URL
 MAX_WAIT_TIME = int(settings.REG_MAX_WAIT_SMS)
 EMAIL_CHECK_INTERVAL = int(settings.REG_EMAIL_CHECK_INTERVAL)
@@ -41,26 +40,24 @@ SOCKS5_PASSWORD = settings.REG_SOCKS5_PASSWORD
 USE_PROXY = bool(settings.REG_USE_PROXY)
 
 # Коды стран — как просил
-COUNTRY_CODES = [117, 34, 56, 49]
+COUNTRY_CODES = [117, 34, 56, 49]  # можно сузить в .env при желании
 
 # Глобальный лимитер: не больше 2 регистраций за 11 минут
 _LIMIT_WINDOW_SEC = 11 * 60
 _LIMIT_MAX_REG = 2
 _rate_lock = threading.Lock()
-_rate_timestamps: List[float] = []  # моменты времени последнего вызова /accounts/register
+_rate_timestamps: List[float] = []  # моменты вызовов /accounts/register
 
 def _rate_limit_blocking():
     """Блокирует поток до разрешения делать новый вызов регистрации SuitePro."""
     while True:
         now = time.time()
         with _rate_lock:
-            # чистим старые отметки
             while _rate_timestamps and (now - _rate_timestamps[0]) > _LIMIT_WINDOW_SEC:
                 _rate_timestamps.pop(0)
             if len(_rate_timestamps) < _LIMIT_MAX_REG:
                 _rate_timestamps.append(now)
                 return
-            # иначе ждём до освобождения слота
             wait_sec = _LIMIT_WINDOW_SEC - (now - _rate_timestamps[0])
         time.sleep(max(1.0, min(wait_sec, 10.0)))
 
@@ -406,7 +403,7 @@ def order_phone(api_key: str, max_retries: int = 20) -> Optional[Dict]:
                 "service": "dh",
                 "country": random.choice(COUNTRY_CODES),
             }
-            # оператор не указываем по требованию
+            # оператор не указываем
             r = requests.get(SMS_ACTIVATE_API_BASE_URL, params=params, timeout=30)
             r.raise_for_status()
             body = r.text.strip()
@@ -474,7 +471,7 @@ def initiate_registration(suite_api_key: str, email_address: str) -> Dict:
 
 def start_phone_verification(suite_api_key: str, reg_data: Dict, verify_url: str, phone: str) -> Dict:
     import requests
-    # выбираем код страны из настроенного списка так же рандомно
+    # код страны выбираем из заданного списка
     cc = str(random.choice(COUNTRY_CODES))
     national = phone.replace(cc, "", 1) if phone.startswith(cc) else phone
     payload = {
@@ -546,13 +543,14 @@ def _process_single(suite_key: str, sms_key: str, acc: EmailAccount) -> bool:
                 return False
             acc.imap_settings = st
         reg_data = initiate_registration(suite_key, acc.email)
+        safe_print(f"[REG] initiated for {acc.email}")
         verify_url = wait_for_verification_email(acc.imap_settings, timeout=MAX_WAIT_TIME)
         if not verify_url:
             safe_print(f"[EMAIL] no verify mail: {acc.email}")
             return False
         phone = order_phone(sms_key)
         if not phone:
-            safe_print("no phone number")
+            safe_print("[SMS] no phone number")
             return False
         activation_id = phone["activation_id"]
         update_activation(sms_key, activation_id, 1)
@@ -560,6 +558,7 @@ def _process_single(suite_key: str, sms_key: str, acc: EmailAccount) -> bool:
         code = wait_sms(sms_key, activation_id, MAX_WAIT_TIME)
         if not code:
             update_activation(sms_key, activation_id, 8)
+            safe_print("[SMS] code not received")
             return False
         complete_phone_verification(suite_key, reg_data, verify_url, code)
         update_activation(sms_key, activation_id, 6)
@@ -567,6 +566,7 @@ def _process_single(suite_key: str, sms_key: str, acc: EmailAccount) -> bool:
         global success_count
         with success_count_lock:
             success_count += 1
+        safe_print(f"[REG] success {acc.email}")
         return True
     except Exception as e:
         safe_print(f"[REG] failed {acc.email}: {e}")
@@ -610,7 +610,7 @@ async def run_registration_batch(
 
     accounts = await asyncio.to_thread(_load_accounts_from_file, file_path)
     if not accounts:
-        await notify("Файл пустой или формат не распознан.")
+        await notify("Файл пустой или формат не распознан (нужно email:pass, по строкам).")
         return
     if isinstance(limit, int) and limit > 0:
         accounts = accounts[:limit]

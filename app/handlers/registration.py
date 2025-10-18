@@ -1,3 +1,4 @@
+# app/handlers/registration.py
 import os
 import tempfile
 from io import BytesIO
@@ -14,8 +15,10 @@ from app.tools.registration_bot import run_registration_batch
 router = Router()
 log = get_logger("klazfiler.registration")
 
+
 class RegStates(StatesGroup):
     waiting_file = State()
+
 
 def reg_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -23,7 +26,9 @@ def reg_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
     )
 
+
 async def _switch_to(target: str, message: Message, state: FSMContext):
+    # обнуляем состояние и уходим в нужный раздел ленивым импортом
     await state.clear()
     await message.answer("Переключаюсь…")
     if target == "list_accounts":
@@ -48,6 +53,7 @@ async def _switch_to(target: str, message: Message, state: FSMContext):
         from app.handlers.menu import back_to_menu
         await back_to_menu(message)
 
+
 _SWITCH_MAP = {
     "👥 Список аккаунтов": "list_accounts",
     "Список аккаунтов": "list_accounts",
@@ -65,6 +71,7 @@ _SWITCH_MAP = {
     "Назад": "back",
 }
 
+
 @router.message(F.text.in_({"📝 Регистрация", "Регистрация"}))
 async def registration_entry(message: Message, state: FSMContext):
     await state.set_state(RegStates.waiting_file)
@@ -75,7 +82,8 @@ async def registration_entry(message: Message, state: FSMContext):
         reply_markup=reg_keyboard(),
     )
 
-# 1) СНАЧАЛА хендлер документов (иначе текстовый перехватит событие)
+
+# 1) СНАЧАЛА документы — иначе текстовый перехватывает событие
 @router.message(RegStates.waiting_file, F.document)
 async def registration_file_received(message: Message, state: FSMContext):
     log.info("registration: document handler triggered")
@@ -83,18 +91,26 @@ async def registration_file_received(message: Message, state: FSMContext):
     file_name = (document.file_name or "mails.txt")
     lower_name = file_name.lower()
     mime = (document.mime_type or "").lower()
+    size_meta = getattr(document, "file_size", None)
+    log.info("document meta: name=%s mime=%s size=%s", file_name, mime, size_meta)
 
+    # принимаем .txt и вообще любой text/*
     if not (lower_name.endswith(".txt") or mime.startswith("text/")):
         await message.answer("Нужен текстовый файл .txt. Пришли ещё раз как документ.")
         return
 
     try:
         await message.answer("⬇️ Скачиваю файл…")
-        # пробуем нативную загрузку
+
+        # 1) пробуем нативную загрузку (aiogram v3)
         try:
             with tempfile.TemporaryDirectory(prefix="reg_") as tmpdir:
-                local_path = os.path.join(tmpdir, lower_name if lower_name.endswith(".txt") else "mails.txt")
+                local_path = os.path.join(
+                    tmpdir, lower_name if lower_name.endswith(".txt") else "mails.txt"
+                )
                 await message.bot.download(document, destination=local_path)
+                size = os.path.getsize(local_path)
+                log.info("file saved: %s (%d bytes)", local_path, size)
 
                 async def notify(text: str) -> None:
                     try:
@@ -102,19 +118,27 @@ async def registration_file_received(message: Message, state: FSMContext):
                     except Exception as e:
                         log.warning("notify failed: %s", e)
 
+                log.info("calling run_registration_batch(file_path=%s)", local_path)
                 await notify("✅ Файл получен. Запускаю регистрацию…")
                 await run_registration_batch(file_path=local_path, notify=notify)
+                log.info("run_registration_batch finished")
 
-        except Exception:
-            # fallback для пересланных документов
+        # 2) fallback для пересланных/нестандартных документов
+        except Exception as e1:
+            log.warning("download(document, ...) failed, fallback to get_file: %s", e1)
             tg_file = await message.bot.get_file(document.file_id)
             buf = BytesIO()
             await message.bot.download_file(tg_file.file_path, buf)
             buf.seek(0)
+
             with tempfile.TemporaryDirectory(prefix="reg_") as tmpdir:
-                local_path = os.path.join(tmpdir, lower_name if lower_name.endswith(".txt") else "mails.txt")
+                local_path = os.path.join(
+                    tmpdir, lower_name if lower_name.endswith(".txt") else "mails.txt"
+                )
                 with open(local_path, "wb") as f:
                     f.write(buf.read())
+                size = os.path.getsize(local_path)
+                log.info("file saved via fallback: %s (%d bytes)", local_path, size)
 
                 async def notify(text: str) -> None:
                     try:
@@ -122,17 +146,24 @@ async def registration_file_received(message: Message, state: FSMContext):
                     except Exception as e:
                         log.warning("notify failed: %s", e)
 
+                log.info("calling run_registration_batch(file_path=%s)", local_path)
                 await message.answer("✅ Файл получен. Запускаю регистрацию…")
                 await run_registration_batch(file_path=local_path, notify=notify)
+                log.info("run_registration_batch finished (fallback)")
 
     except Exception as e:
         log.exception("Ошибка при скачивании/обработке файла: %s", e)
         await message.answer(f"❌ Не удалось обработать файл: {e}")
 
+    # остаёмся в режиме загрузки — можно кидать следующий .txt
     await state.set_state(RegStates.waiting_file)
-    await message.answer("Если нужно — пришли ещё один .txt.\nИли «⬅️ Назад» для выхода.", reply_markup=reg_keyboard())
+    await message.answer(
+        "Если нужно — пришли ещё один .txt.\nИли «⬅️ Назад» для выхода.",
+        reply_markup=reg_keyboard(),
+    )
 
-# 2) ПОТОМ текст — и только если это НЕ документ
+
+# 2) ПОТОМ текст — и только если это не документ
 @router.message(RegStates.waiting_file, ~F.document, F.text.cast(str).as_("text"))
 async def registration_switch_or_prompt(message: Message, state: FSMContext, text: str):
     log.info("registration: text handler triggered")
