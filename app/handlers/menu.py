@@ -1,21 +1,18 @@
+# /opt/klazfiler/app/handlers/menu.py
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-import logging
 from aiogram import Router, F, types
-
 from app.keyboards import main_keyboard
-# если у тебя есть модуль быстропоста — импортируем точку входа
-try:
-    from app.handlers.quick_post import quickpost_entry
-except Exception:
-    quickpost_entry = None  # переживём временно
 
-logger = logging.getLogger("klazfiler.menu")
+# реальные точки входа из модулей
+from app.handlers.list_accounts import list_accounts_open
+from app.handlers.add_account import addacc_enter
+from app.handlers.registration import registration_entry
+from app.handlers.archive import open_archive
+from app.handlers.grabber import grabber_enter
+from app.tools.quickpost import quickpost_entry  # файл должен лежать в app/tools/quickpost.py
 
-# aiogram v3: нужен Router
 router = Router(name="menu")
 
-# Тексты кнопок (держим здесь, чтобы не трогать keyboards.py)
 BTN_QUICKPOST = "⚡ Быстрая публикация"
 BTN_GRABBER   = "📥 Grabber"
 BTN_ARCHIVE   = "🗂 Архив товаров"
@@ -23,49 +20,37 @@ BTN_ADDACC    = "➕ Добавить аккаунт"
 BTN_LISTACC   = "👥 Список аккаунтов"
 BTN_REG       = "📝 Регистрация"
 BTN_BACK      = "⬅️ Назад"
-BTN_FILTERS   = "⚙️ Фильтры"
-BTN_123       = "🔢 123"
 
-# /start и /menu
-@router.message(F.text.as_("text") & (F.text == "/start") | (F.text == "/menu"))
-async def cmd_start(message: types.Message, text: str):
+@router.message(F.text.in_({"/start", "/menu"}))
+async def cmd_start(message: types.Message):
     await message.answer("Меню:", reply_markup=main_keyboard())
 
-# Обработка нажатий по тексту кнопок
-@router.message(F.text)
-async def on_menu_message(message: types.Message):
-    txt = (message.text or "").strip()
+# точечные хендлеры по кнопкам (без общего ловца F.text)
+@router.message(F.text.in_({BTN_GRABBER, "Grabber"}))
+async def _grabber(message: types.Message):
+    # grabber сам переведёт в своё состояние
+    await grabber_enter(message, state=None)
 
-    if txt == BTN_QUICKPOST:
-        if quickpost_entry is None:
-            await message.answer("Быстрая публикация пока недоступна (модуль не найден).")
-            return
-        await quickpost_entry(message)
-        return
+@router.message(F.text == BTN_QUICKPOST)
+async def _quickpost(message: types.Message):
+    await quickpost_entry(message)
 
-    if txt == BTN_GRABBER:
-        await message.answer("Граббер откроем позже (пока заглушка).")
-        return
+@router.message(F.text.in_({BTN_LISTACC, "Список аккаунтов"}))
+async def _listacc(message: types.Message):
+    await list_accounts_open(message)
 
-    if txt == BTN_ARCHIVE:
-        await message.answer("Архив откроем позже (пока заглушка).")
-        return
+@router.message(F.text.in_({BTN_ADDACC, "Добавить аккаунт"}))
+async def _addacc(message: types.Message):
+    await addacc_enter(message, state=None)
 
-    if txt == BTN_ADDACC:
-        await message.answer("Добавление аккаунта (пока заглушка).")
-        return
+@router.message(F.text.in_({BTN_REG, "Регистрация"}))
+async def _reg(message: types.Message):
+    await registration_entry(message, state=None)
 
-    if txt == BTN_LISTACC:
-        await message.answer("Список аккаунтов (пока заглушка).")
-        return
+@router.message(F.text == BTN_ARCHIVE)
+async def _archive(message: types.Message):
+    await open_archive(message)
 
-    if txt == BTN_REG:
-        await message.answer("Регистрация — у тебя есть отдельный модуль. Откроем оттуда.")
-        return
-
-    if txt in (BTN_BACK, BTN_FILTERS, BTN_123):
-        await message.answer("Ок", reply_markup=main_keyboard())
-        return
-
-    # если пришло что-то постороннее — просто покажем меню
-    await message.answer("Не понял. Давай так:", reply_markup=main_keyboard())
+@router.message(F.text == BTN_BACK)
+async def _back(message: types.Message):
+    await message.answer("Ок", reply_markup=main_keyboard())

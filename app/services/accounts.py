@@ -13,10 +13,10 @@ ADD_TOKENS_URL = f"{BASE}/accounts/tokens"
 def _headers() -> dict[str, str]:
     key = (settings.SUITEPRO_API_KEY or "").strip()
     return {
-        "Authorization": f"Bearer {key}",
-        "X-API-Key": key,
+        "X-API-Key": key,              # ключевой заголовок
         "Accept": "application/json",
         "Content-Type": "application/json",
+        "User-Agent": "klazfiler/1.0",
     }
 
 
