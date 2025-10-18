@@ -1,165 +1,143 @@
-# app/handlers/registration.py
-import asyncio
 import os
 import tempfile
-from typing import Callable, Awaitable
+from io import BytesIO
 
 from aiogram import Router, F
-from aiogram.types import (
-    Message,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ContentType,
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
 from app.keyboards import main_keyboard
 from app.logging_setup import get_logger
-from app.registration_bot import run_registration_batch
+from app.tools.registration_bot import run_registration_batch
 
 router = Router()
 log = get_logger("klazfiler.registration")
 
-
-# --------- FSM ----------
 class RegStates(StatesGroup):
-    idle = State()
     waiting_file = State()
 
-
-# --------- Keyboards ----------
 def reg_keyboard() -> ReplyKeyboardMarkup:
-    """
-    Локальное меню регистрации.
-    Обязательно передаём поле `keyboard`, иначе pydantic у aiogram 3 валится.
-    """
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🚀 Старт регистрации")],
-            [KeyboardButton(text="⬅️ Назад")],
-        ],
+        keyboard=[[KeyboardButton(text="⬅️ Назад")]],
         resize_keyboard=True,
     )
 
-
-# --------- Helpers ----------
-async def _notify(message: Message, text: str) -> None:
-    try:
-        await message.answer(text)
-    except Exception as e:
-        log.warning("Не удалось отправить уведомление в чат: %s", e)
-
-
-def _build_notifier(message: Message) -> Callable[[str], Awaitable[None]]:
-    """Вернёт колбэк, который registration_bot сможет вызывать для промежуточных сообщений."""
-    async def _inner(text: str) -> None:
-        await _notify(message, text)
-    return _inner
-
-
-async def _run_batch_with_file(message: Message, file_path: str) -> None:
-    """
-    Запускаем партию регистраций.
-    Предполагаем, что внутри run_registration_batch реализованы:
-      - лимит 2 регистрации за запуск,
-      - пауза 11 минут между батчами (или она не нужна, если батч один),
-      - пошаговые уведомления через переданный notify().
-    """
-    notify = _build_notifier(message)
-
-    await notify("✅ Файл получен. Начинаю обработку…")
-    try:
-        # Если run_registration_batch синхронная, можно обернуть:
-        # await asyncio.to_thread(run_registration_batch, file_path=file_path, notify=notify)
-        await run_registration_batch(file_path=file_path, notify=notify)
-    except Exception as e:
-        log.exception("Ошибка при запуске регистрации: %s", e)
-        await notify(f"❌ Ошибка при регистрации: {e}")
-        return
-
-    await notify("🏁 Готово. Партия регистраций завершена.")
-
-
-# --------- Entry points ----------
-@router.message(F.text == "📝 Регистрация")
-async def registration_entry(message: Message, state: FSMContext):
-    """
-    Точка входа из главного меню.
-    Показываем подменю регистрации.
-    """
-    await state.set_state(RegStates.idle)
-    await message.answer(
-        "Раздел «Регистрация». Выберите действие:",
-        reply_markup=reg_keyboard(),
-    )
-
-
-@router.message(F.text == "🚀 Старт регистрации")
-async def registration_start(message: Message, state: FSMContext):
-    """
-    Просим прислать .txt со списком почт в формате:
-      mail:pass|
-      mail2:pass2|
-    """
-    await state.set_state(RegStates.waiting_file)
-    await message.answer(
-        "Пришлите .txt-файл со списком почт в формате:\n"
-        "`mail:pass|` (каждая пара на одной строке или через `|`).\n\n"
-        "Файл — как *документ* (скрепка).",
-        reply_markup=reg_keyboard(),
-        parse_mode="Markdown",
-    )
-
-
-@router.message(F.text == "⬅️ Назад")
-async def registration_back_to_menu(message: Message, state: FSMContext):
-    """
-    Возврат в главное меню бота.
-    """
+async def _switch_to(target: str, message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Главное меню:", reply_markup=main_keyboard())
+    await message.answer("Переключаюсь…")
+    if target == "list_accounts":
+        from app.handlers.list_accounts import list_accounts_open
+        await list_accounts_open(message)
+    elif target == "add_account":
+        from app.handlers.add_account import addacc_enter
+        await addacc_enter(message, state)
+    elif target == "archive":
+        from app.handlers.archive import open_archive
+        await open_archive(message)
+    elif target == "quick":
+        from app.handlers.menu import quick_publish
+        await quick_publish(message)
+    elif target == "filters":
+        from app.handlers.menu import filters
+        await filters(message)
+    elif target == "test":
+        from app.handlers.menu import test_section
+        await test_section(message)
+    elif target == "back":
+        from app.handlers.menu import back_to_menu
+        await back_to_menu(message)
 
+_SWITCH_MAP = {
+    "👥 Список аккаунтов": "list_accounts",
+    "Список аккаунтов": "list_accounts",
+    "➕ Добавить аккаунт": "add_account",
+    "Добавить аккаунт": "add_account",
+    "🗂 Архив товаров": "archive",
+    "Архив товаров": "archive",
+    "⚡ Быстрая публикация": "quick",
+    "Быстрая публикация": "quick",
+    "⚙️ Фильтры": "filters",
+    "Фильтры": "filters",
+    "🔢 123": "test",
+    "123": "test",
+    "⬅️ Назад": "back",
+    "Назад": "back",
+}
 
-# --------- File handler ----------
-@router.message(RegStates.waiting_file, F.content_type == ContentType.DOCUMENT)
+@router.message(F.text.in_({"📝 Регистрация", "Регистрация"}))
+async def registration_entry(message: Message, state: FSMContext):
+    await state.set_state(RegStates.waiting_file)
+    log.info("enter registration: waiting_file")
+    await message.answer(
+        "Пришли .txt со списком почт (email:pass, по строкам или через |).\n"
+        "Отправь как документ (скрепка).",
+        reply_markup=reg_keyboard(),
+    )
+
+# 1) СНАЧАЛА хендлер документов (иначе текстовый перехватит событие)
+@router.message(RegStates.waiting_file, F.document)
 async def registration_file_received(message: Message, state: FSMContext):
-    """
-    Обрабатываем присланный .txt как документ.
-    Сохраняем во временный файл и передаём в движок регистрации.
-    """
+    log.info("registration: document handler triggered")
     document = message.document
+    file_name = (document.file_name or "mails.txt")
+    lower_name = file_name.lower()
+    mime = (document.mime_type or "").lower()
 
-    # Простая валидация типа/расширения
-    filename = (document.file_name or "").lower()
-    if not filename.endswith(".txt"):
-        await message.answer("Нужен текстовый файл с расширением .txt. Пришлите ещё раз.")
+    if not (lower_name.endswith(".txt") or mime.startswith("text/")):
+        await message.answer("Нужен текстовый файл .txt. Пришли ещё раз как документ.")
         return
 
-    # Скачиваем во временный файл
     try:
-        with tempfile.TemporaryDirectory(prefix="reg_") as tmpdir:
-            local_path = os.path.join(tmpdir, filename or "emails.txt")
-            await message.answer("⬇️ Скачиваю файл…")
-            await message.bot.download(document, destination=local_path)
+        await message.answer("⬇️ Скачиваю файл…")
+        # пробуем нативную загрузку
+        try:
+            with tempfile.TemporaryDirectory(prefix="reg_") as tmpdir:
+                local_path = os.path.join(tmpdir, lower_name if lower_name.endswith(".txt") else "mails.txt")
+                await message.bot.download(document, destination=local_path)
 
-            await _run_batch_with_file(message, local_path)
+                async def notify(text: str) -> None:
+                    try:
+                        await message.answer(text)
+                    except Exception as e:
+                        log.warning("notify failed: %s", e)
+
+                await notify("✅ Файл получен. Запускаю регистрацию…")
+                await run_registration_batch(file_path=local_path, notify=notify)
+
+        except Exception:
+            # fallback для пересланных документов
+            tg_file = await message.bot.get_file(document.file_id)
+            buf = BytesIO()
+            await message.bot.download_file(tg_file.file_path, buf)
+            buf.seek(0)
+            with tempfile.TemporaryDirectory(prefix="reg_") as tmpdir:
+                local_path = os.path.join(tmpdir, lower_name if lower_name.endswith(".txt") else "mails.txt")
+                with open(local_path, "wb") as f:
+                    f.write(buf.read())
+
+                async def notify(text: str) -> None:
+                    try:
+                        await message.answer(text)
+                    except Exception as e:
+                        log.warning("notify failed: %s", e)
+
+                await message.answer("✅ Файл получен. Запускаю регистрацию…")
+                await run_registration_batch(file_path=local_path, notify=notify)
 
     except Exception as e:
         log.exception("Ошибка при скачивании/обработке файла: %s", e)
         await message.answer(f"❌ Не удалось обработать файл: {e}")
 
-    finally:
-        # Возвращаемся в режим ожидания нового файла, чтобы можно было слать следующий
-        await state.set_state(RegStates.waiting_file)
-        await message.answer(
-            "Если хотите обработать ещё один файл — пришлите его.\n"
-            "Или нажмите «⬅️ Назад» для выхода.",
-            reply_markup=reg_keyboard(),
-        )
+    await state.set_state(RegStates.waiting_file)
+    await message.answer("Если нужно — пришли ещё один .txt.\nИли «⬅️ Назад» для выхода.", reply_markup=reg_keyboard())
 
-
-# Страховка: если пользователь шлёт не документ в состоянии ожидания файла
-@router.message(RegStates.waiting_file)
-async def registration_waiting_wrong_content(message: Message):
-    await message.answer("Мне нужен .txt-файл со списком почт. Пришлите его как документ (скрепка).")
+# 2) ПОТОМ текст — и только если это НЕ документ
+@router.message(RegStates.waiting_file, ~F.document, F.text.cast(str).as_("text"))
+async def registration_switch_or_prompt(message: Message, state: FSMContext, text: str):
+    log.info("registration: text handler triggered")
+    target = _SWITCH_MAP.get(text)
+    if target:
+        await _switch_to(target, message, state)
+    else:
+        await message.answer("Жду .txt-файл как документ. Или «⬅️ Назад».")

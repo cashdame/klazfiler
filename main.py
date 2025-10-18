@@ -1,22 +1,32 @@
 import asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 from app.logging_setup import setup_logging, get_logger
-from app import config
+from app.config import settings
 
-from app.handlers import start, menu, grabber, archive, list_accounts, add_account, registration, fallback
+from app.handlers import (
+    start,
+    menu,
+    grabber,
+    archive,
+    list_accounts,
+    add_account,
+    registration,
+    fallback,
+)
 
 async def main():
     setup_logging()
     log = get_logger("klazfiler")
 
-    if not config.BOT_TOKEN:
+    if not settings.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан в .env")
 
     bot = Bot(
-        token=config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode="HTML"),
+        token=settings.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
 

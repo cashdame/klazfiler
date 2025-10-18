@@ -17,37 +17,79 @@ class AddAccSG(StatesGroup):
 PROMPT = (
     "Режим добавления аккаунта.\n"
     "Пришли .txt или текст с полями:\n\n"
-    "Вариант 1 (key: value):\n"
-    "username: user@mail.com\n"
-    "accessToken: eyJhbGciOi...\n"
-    "refreshToken: eyJhbGciOi...\n"
-    "userIdToken: 12345678\n"
+    "username: user@mail.com\naccessToken: ...\nrefreshToken: ...\nuserIdToken: ...\n"
     "proxyURL: http://user:pass@host:port  (необязательно)\n\n"
-    "Вариант 2 (JSON):\n"
-    "{\n"
-    '  "username": "user@mail.com",\n'
-    '  "accessToken": "...",\n'
-    '  "refreshToken": "...",\n'
-    '  "userIdToken": "12345678",\n'
-    '  "proxyURL": "http://user:pass@host:port"\n'
-    "}\n\n"
-    "Выйти: «Назад» или /cancel"
+    "Выйти: «⬅️ Назад» или /cancel"
 )
 
-@router.message(F.text == "Добавить аккаунт")
+async def _switch_to(target: str, message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Переключаюсь…")
+    if target == "list_accounts":
+        from app.handlers.list_accounts import list_accounts_open
+        await list_accounts_open(message)
+    elif target == "registration":
+        from app.handlers.registration import registration_entry
+        await registration_entry(message, state)
+    elif target == "archive":
+        from app.handlers.archive import open_archive
+        await open_archive(message)
+    elif target == "quick":
+        from app.handlers.menu import quick_publish
+        await quick_publish(message)
+    elif target == "filters":
+        from app.handlers.menu import filters
+        await filters(message)
+    elif target == "test":
+        from app.handlers.menu import test_section
+        await test_section(message)
+    elif target == "back":
+        from app.handlers.menu import back_to_menu
+        await back_to_menu(message)
+
+_SWITCH_MAP = {
+    "👥 Список аккаунтов": "list_accounts",
+    "Список аккаунтов": "list_accounts",
+    "📝 Регистрация": "registration",
+    "Регистрация": "registration",
+    "🗂 Архив товаров": "archive",
+    "Архив товаров": "archive",
+    "⚡ Быстрая публикация": "quick",
+    "Быстрая публикация": "quick",
+    "⚙️ Фильтры": "filters",
+    "Фильтры": "filters",
+    "🔢 123": "test",
+    "123": "test",
+    "⬅️ Назад": "back",
+    "Назад": "back",
+}
+
+@router.message(F.text.in_({"➕ Добавить аккаунт", "Добавить аккаунт"}))
 async def addacc_enter(message: types.Message, state: FSMContext):
     await state.set_state(AddAccSG.waiting_data)
     await message.answer(PROMPT)
 
-@router.message(AddAccSG.waiting_data, F.text.in_({"Назад", "Меню", "/cancel", "/stop"}))
-async def addacc_exit(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Вышел из режима добавления. Главное меню:", reply_markup=main_keyboard())
+@router.message(AddAccSG.waiting_data, F.text.cast(str).as_("text"))
+async def addacc_switch_or_text(message: types.Message, state: FSMContext, text: str):
+    target = _SWITCH_MAP.get(text)
+    if target:
+        await _switch_to(target, message, state)
+        return
+    await _process_payload_text(message, text)
 
-# -------- парсинг входа --------
+@router.message(AddAccSG.waiting_data, F.document)
+async def addacc_file(message: types.Message, state: FSMContext):
+    doc = message.document
+    fn = (doc.file_name or "").lower()
+    if not (fn.endswith(".txt") or (doc.mime_type and "text" in doc.mime_type.lower())):
+        await message.answer("Нужен .txt или просто текст сообщением.")
+        return
+    file = await message.bot.get_file(doc.file_id)
+    content = await message.bot.download_file(file.file_path)
+    text = content.read().decode("utf-8", errors="ignore")
+    await _process_payload_text(message, text)
 
 _KEYVAL_RE = re.compile(r"^\s*([A-Za-z_][\w\-]*)\s*:\s*(.+?)\s*$", re.M)
-_COOKIE_ARRAY_SIGNS = ('"name"', '"value"')
 _NUM_ID_RE = re.compile(r"\b(\d{6,})\b")
 
 def _from_keyvals(text: str) -> Dict[str, str]:
@@ -68,13 +110,11 @@ def _from_cookies_array(text: str) -> Optional[Dict[str, str]]:
     if not isinstance(js, list):
         return None
     cookies = {str(it.get("name", "")).lower(): str(it.get("value", "")) for it in js if isinstance(it, dict)}
-    access = cookies.get("access_token") or cookies.get("accessToken")
-    refresh = cookies.get("refresh_token") or cookies.get("refreshToken")
-    idtok  = cookies.get("id_token") or cookies.get("idToken") or cookies.get("userid") or cookies.get("userId")
     out: Dict[str, str] = {}
-    if access: out["accessToken"] = access
-    if refresh: out["refreshToken"] = refresh
-    if idtok: out["userIdToken"] = idtok
+    if v := cookies.get("access_token") or cookies.get("accessToken"): out["accessToken"] = v
+    if v := cookies.get("refresh_token") or cookies.get("refreshToken"): out["refreshToken"] = v
+    if v := cookies.get("id_token") or cookies.get("idToken") or cookies.get("userid") or cookies.get("userId"):
+        out["userIdToken"] = v
     return out or None
 
 def _normalize_payload(raw: Dict[str, Any]) -> Dict[str, str]:
@@ -99,17 +139,14 @@ def _normalize_payload(raw: Dict[str, Any]) -> Dict[str, str]:
 
 def parse_account_text(text: str) -> Dict[str, str]:
     text = text.strip()
-    js = _from_json(text)
-    if isinstance(js, dict):
+    if isinstance(js := _from_json(text), dict):
         js["__source_text__"] = text
         return _normalize_payload(js)
-    if all(s in text for s in _COOKIE_ARRAY_SIGNS):
-        cookie_map = _from_cookies_array(text)
-        if cookie_map:
-            cookie_map["__source_text__"] = text
-            return _normalize_payload(cookie_map)
-    kv = _from_keyvals(text)
-    if kv:
+    if text.startswith("[") and '"name"' in text and '"value"' in text:
+        if m := _from_cookies_array(text):
+            m["__source_text__"] = text
+            return _normalize_payload(m)
+    if kv := _from_keyvals(text):
         kv["__source_text__"] = text
         return _normalize_payload(kv)
     return {}
@@ -119,30 +156,11 @@ def _validate(p: Dict[str, str]) -> Optional[str]:
     miss = [k for k in need if not p.get(k)]
     return ("Не хватает полей: " + ", ".join(miss)) if miss else None
 
-# -------- обработчики данных --------
-
-@router.message(AddAccSG.waiting_data, F.document)
-async def addacc_file(message: types.Message, state: FSMContext):
-    doc = message.document
-    if doc.mime_type and not doc.mime_type.startswith("text"):
-        await message.answer("Нужен текстовый .txt файл или просто текст сообщением.")
-        return
-    file = await message.bot.get_file(doc.file_id)
-    content = await message.bot.download_file(file.file_path)
-    text = content.read().decode("utf-8", errors="ignore")
-    await _process_payload_text(message, text)
-
-@router.message(AddAccSG.waiting_data, F.text)
-async def addacc_text(message: types.Message, state: FSMContext):
-    await _process_payload_text(message, message.text or "")
-
 async def _process_payload_text(message: types.Message, text: str):
     data = parse_account_text(text)
-    err = _validate(data)
-    if err:
+    if err := _validate(data):
         await message.answer(f"Формат не распознан. {err}\n\n" + PROMPT)
         return
-
     status, resp = await add_account_tokens(
         username=data["username"],
         accessToken=data["accessToken"],
@@ -150,11 +168,11 @@ async def _process_payload_text(message: types.Message, text: str):
         userIdToken=data["userIdToken"],
         proxyURL=data.get("proxyURL"),
     )
-
     if status == 200:
         await message.answer(
             f"✅ Аккаунт добавлен: <b>{data['username']}</b>\n"
-            f"Можно присылать следующий.\nДля выхода — «Назад» или /cancel."
+            f"Можно присылать следующий.\nВыход — «⬅️ Назад» или /cancel.",
+            reply_markup=main_keyboard()
         )
     else:
         msg = resp.get("message") if isinstance(resp, dict) else str(resp)

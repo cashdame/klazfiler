@@ -19,10 +19,8 @@ router = Router()
 PAGE_SIZE = 12
 BTN_COLS = 2
 
-
 def _check(v: bool) -> str:
     return "✅" if v else "❌"
-
 
 def _format_account(idx: int, acc: Dict) -> str:
     username = acc.get("username", "-")
@@ -36,7 +34,6 @@ def _format_account(idx: int, acc: Dict) -> str:
         f"{idx}. {username} • {type_} • in {logged} • Ads {ads} • Conv {conv} • verified {verified}\n"
         f"• {created}"
     )
-
 
 def _kb(accounts: List[Dict], page: int, total: Optional[int], has_more: bool) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
@@ -70,7 +67,6 @@ def _kb(accounts: List[Dict], page: int, total: Optional[int], has_more: bool) -
     rows.append([InlineKeyboardButton(text="Назад в меню", callback_data="accs:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 async def _render_page_msg(message: Message, page: int, *, edit_message: Message | None = None) -> None:
     limit = PAGE_SIZE
     cursor = page * limit
@@ -100,13 +96,10 @@ async def _render_page_msg(message: Message, page: int, *, edit_message: Message
     else:
         await message.answer(f"❌ Не удалось получить список аккаунтов.\n{err}")
 
-
-@router.message(F.text == "Список аккаунтов")
+@router.message(F.text.in_({"👥 Список аккаунтов", "Список аккаунтов"}))
 async def list_accounts_open(message: Message) -> None:
-    # даём мгновенную реакцию
     loading = await message.answer("Загружаю список…")
     await _render_page_msg(message, page=0, edit_message=loading)
-
 
 @router.callback_query(F.data.startswith("accs:page:"))
 async def list_accounts_page(call: CallbackQuery) -> None:

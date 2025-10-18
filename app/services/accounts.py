@@ -5,13 +5,13 @@ from typing import Any, Tuple
 
 from app.config import settings
 
-BASE = settings.api_base_url.rstrip("/")
+BASE = settings.SUITEPRO_API_URL.rstrip("/")
 ACCOUNTS_URL = f"{BASE}/accounts"
 ADD_TOKENS_URL = f"{BASE}/accounts/tokens"
 
 
 def _headers() -> dict[str, str]:
-    key = settings.suitepro_api_key.strip()
+    key = (settings.SUITEPRO_API_KEY or "").strip()
     return {
         "Authorization": f"Bearer {key}",
         "X-API-Key": key,
@@ -22,7 +22,7 @@ def _headers() -> dict[str, str]:
 
 async def list_accounts(cursor: int = 0, limit: int = 12) -> Tuple[int, Any]:
     params = {"cursor": cursor, "limit": limit}
-    timeout = aiohttp.ClientTimeout(total=settings.api_timeout)
+    timeout = aiohttp.ClientTimeout(total=settings.API_TIMEOUT)
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=_headers()) as s:
             async with s.get(ACCOUNTS_URL, params=params) as r:
@@ -50,7 +50,7 @@ async def add_account_tokens(
     if proxyURL:
         payload["proxyURL"] = proxyURL
 
-    timeout = aiohttp.ClientTimeout(total=settings.api_timeout)
+    timeout = aiohttp.ClientTimeout(total=settings.API_TIMEOUT)
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=_headers()) as s:
             async with s.post(ADD_TOKENS_URL, json=payload) as r:

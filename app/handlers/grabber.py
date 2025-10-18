@@ -1,9 +1,8 @@
-# /opt/klazfiler/app/handlers/grabber.py
 import re
 import asyncio
-from typing import List
+from typing import List, Callable, Awaitable, Optional
 
-from aiogram import Router, types
+from aiogram import Router, types, F
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.types import FSInputFile
@@ -13,38 +12,80 @@ from app.services.core import save_ad
 
 router = Router()
 
-# Состояние «жду ссылки, работаю в режиме граббера»
 class GrabberSG(StatesGroup):
     waiting_url = State()
 
-# Находим все URL в сообщении
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
-@router.message(lambda m: m.text == "Grabber")
+async def _switch_to(target: str, message: types.Message, state: FSMContext):
+    # убираем текущее состояние и вызываем нужный раздел через ленивый импорт
+    await state.clear()
+    await message.answer("Переключаюсь…")
+    if target == "list_accounts":
+        from app.handlers.list_accounts import list_accounts_open
+        await list_accounts_open(message)
+    elif target == "registration":
+        from app.handlers.registration import registration_entry
+        await registration_entry(message, state)
+    elif target == "add_account":
+        from app.handlers.add_account import addacc_enter
+        await addacc_enter(message, state)
+    elif target == "archive":
+        from app.handlers.archive import open_archive
+        await open_archive(message)
+    elif target == "quick":
+        from app.handlers.menu import quick_publish
+        await quick_publish(message)
+    elif target == "filters":
+        from app.handlers.menu import filters
+        await filters(message)
+    elif target == "test":
+        from app.handlers.menu import test_section
+        await test_section(message)
+    elif target == "back":
+        from app.handlers.menu import back_to_menu
+        await back_to_menu(message)
+
+_SWITCH_MAP = {
+    "👥 Список аккаунтов": "list_accounts",
+    "Список аккаунтов": "list_accounts",
+    "📝 Регистрация": "registration",
+    "Регистрация": "registration",
+    "➕ Добавить аккаунт": "add_account",
+    "Добавить аккаунт": "add_account",
+    "🗂 Архив товаров": "archive",
+    "Архив товаров": "archive",
+    "⚡ Быстрая публикация": "quick",
+    "Быстрая публикация": "quick",
+    "⚙️ Фильтры": "filters",
+    "Фильтры": "filters",
+    "🔢 123": "test",
+    "123": "test",
+    "⬅️ Назад": "back",
+    "Назад": "back",
+}
+
+@router.message(F.text.in_({"📥 Grabber", "Grabber"}))
 async def grabber_enter(message: types.Message, state: FSMContext):
-    # Входим в режим и остаёмся в нём, пока пользователь не выйдет
     await state.set_state(GrabberSG.waiting_url)
     await message.answer(
         "Режим граббера активирован.\n"
-        "Кидай ссылки на объявления (Kleinanzeigen / eBay / Willhaben) — можно сразу несколько, хоть по одной строке.\n"
-        "Чтобы выйти, нажми «Назад» или отправь /cancel."
+        "Кидай ссылки на объявления — можно несколько сразу.\n"
+        "Чтобы выйти, нажми «⬅️ Назад» или отправь /cancel."
     )
 
-@router.message(GrabberSG.waiting_url, lambda m: m.text in {"Назад", "Меню", "/cancel", "/stop"})
-async def grabber_exit(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Вышел из режима граббера. Главное меню:", reply_markup=main_keyboard())
-
-@router.message(GrabberSG.waiting_url)
-async def grabber_process(message: types.Message, state: FSMContext):
-    text = (message.text or "").strip()
-    urls: List[str] = URL_RE.findall(text)
-
-    if not urls:
-        await message.answer("Жду ссылку. Можно отправлять по одной или несколько в сообщении.\nДля выхода — «Назад» или /cancel.")
+@router.message(GrabberSG.waiting_url, F.text.cast(str).as_("text"))
+async def grabber_switch_or_process(message: types.Message, state: FSMContext, text: str):
+    target = _SWITCH_MAP.get(text)
+    if target:
+        await _switch_to(target, message, state)
         return
 
-    # Обрабатываем по очереди, чтобы не забивать сеть
+    urls: List[str] = URL_RE.findall(text or "")
+    if not urls:
+        await message.answer("Жду ссылку. Можно несколько в одном сообщении.\nДля выхода — «⬅️ Назад» или /cancel.")
+        return
+
     for url in urls:
         progress = await message.answer(f"Обрабатываю:\n{url}")
         try:
@@ -52,13 +93,15 @@ async def grabber_process(message: types.Message, state: FSMContext):
             if not path:
                 await progress.edit_text(f"Не удалось сохранить объявление:\n{url}")
                 continue
-
             await progress.edit_text("Готово. Шлю архив…")
             await message.answer_document(
                 FSInputFile(path),
-                caption="Архив объявления сохранён. Можно прислать ещё ссылку.\nДля выхода — «Назад» или /cancel."
+                caption="Архив готов. Можешь прислать ещё ссылку.\nВыход — «⬅️ Назад» или /cancel."
             )
         except Exception as e:
-            await progress.edit_text(f"Ошибка при обработке ссылки:\n{url}\n{e}")
+            await progress.edit_text(f"Ошибка при обработке:\n{url}\n{e}")
 
-    # ВАЖНО: состояние НЕ очищаем — остаёмся в режиме до явного выхода
+@router.message(GrabberSG.waiting_url, F.text.in_({"/cancel", "/stop"}))
+async def grabber_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Вышел из режима граббера. Главное меню:", reply_markup=main_keyboard())

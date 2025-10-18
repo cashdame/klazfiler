@@ -4,7 +4,7 @@ from app.keyboards import main_keyboard
 
 router = Router()
 
-@router.message(F.text == "Архив товаров")
+@router.message(F.text.in_({"🗂 Архив товаров", "Архив товаров"}))
 async def open_archive(message: Message):
     await message.answer(
         "Раздел Архив товаров. Тут будут сохранённые объявления.",

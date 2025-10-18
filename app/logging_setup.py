@@ -33,3 +33,18 @@ def get_logger(name: str) -> logging.Logger:
     if not _configured:
         setup_logging()
     return logging.getLogger(name)
+
+def get_registration_logger():
+    """Логгер для регистратора с выводом в консоль и файл"""
+    setup_logging()  # гарантируем, что общая конфигурация есть
+    logger = logging.getLogger("registration")
+    logger.setLevel(logging.INFO)
+
+    # если уже есть file handler — не дублируем
+    if not any(isinstance(h, logging.FileHandler) and h.baseFilename.endswith("registration.log") for h in logger.handlers):
+        fh = logging.FileHandler("registration.log", encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        logger.addHandler(fh)
+
+    return logger
+

@@ -1,4 +1,3 @@
-# app/config.py
 from pydantic import Field, AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -6,36 +5,39 @@ class Settings(BaseSettings):
     # Telegram
     BOT_TOKEN: str = Field(..., alias="BOT_TOKEN")
 
-    # SuitePro
+    # SuitePro API (фиксированный базовый URL)
     SUITEPRO_API_URL: str = "https://api.suitepro.to"
-    SUITEPRO_API_KEY: str
-    SUITEPRO_CATEGORIES_URL: str = "https://api.suitepro.to/categories"
-    SUITEPRO_METADATA_URL: str = "https://api.suitepro.to/metadata"
-    SUITEPRO_CLASSIFIEDS_URL: str = "https://api.suitepro.to/classifieds/"
+    SUITEPRO_API_KEY: str = ""
 
     # SMS-Activate
     SMS_ACTIVATE_URL: str = "https://api.sms-activate.ae/stubs/handler_api.php"
-    # примет либо SMS_ACTIVATE_KEY, либо SMS_ACTIVATE_API_KEY
     SMS_ACTIVATE_KEY: str = Field(
-        ...,
+        default="",
         validation_alias=AliasChoices("SMS_ACTIVATE_KEY", "SMS_ACTIVATE_API_KEY"),
     )
 
-    # OpenAI
-    OPENAI_API_KEY: str | None = None
-    OPENAI_API_BASE: str | None = None
-    OPENAI_MODEL: str | None = None
-
-    # Paths
+    # Архив граббера
     ARCHIVE_DIR: str = "/opt/klazfiler/archive"
 
-    # HTTP settings
+    # HTTP
     API_TIMEOUT: int = 120
     API_RETRIES: int = 3
 
-    # Email check
-    EMAIL_CHECK_INTERVAL: int = 2
-    EMAIL_OVERALL_TIMEOUT: int = 180
+    # --- Регистрация ---
+    # потоков и паузы можно оставить как есть
+    REG_MAX_WAIT_SMS: int = 60
+    REG_EMAIL_CHECK_INTERVAL: int = 5
+    REG_MAX_THREADS: int = 10
+    REG_MAX_IMAP_WORKERS: int = 10
+    REG_CONNECTION_TIMEOUT: int = 30
+    REG_LOGIN_TIMEOUT: int = 30
+
+    # SOCKS5 (опционально)
+    REG_USE_PROXY: bool = False
+    REG_SOCKS5_HOST: str = "eu.proxys5.net"
+    REG_SOCKS5_PORT: int = 6200
+    REG_SOCKS5_USER_TEMPLATE: str = "{session_id}"
+    REG_SOCKS5_PASSWORD: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -43,8 +45,4 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-def get_settings() -> Settings:
-    return Settings()
-
-# На уровне модуля можно сразу создать singleton
-settings = get_settings()
+settings = Settings()
