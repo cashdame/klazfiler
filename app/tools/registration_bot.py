@@ -12,11 +12,15 @@ import subprocess
 import email
 import threading
 import socks
+import requests
 from email.header import decode_header
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Set, Tuple, Awaitable, Callable
 from dataclasses import dataclass
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from app.config import settings
 from app.logging_setup import get_logger
@@ -32,6 +36,7 @@ MAX_THREADS = int(settings.REG_MAX_THREADS)
 MAX_IMAP_WORKERS = int(settings.REG_MAX_IMAP_WORKERS)
 CONNECTION_TIMEOUT = int(settings.REG_CONNECTION_TIMEOUT)
 LOGIN_TIMEOUT = int(settings.REG_LOGIN_TIMEOUT)
+SUITEPRO_HTTP_READ_TIMEOUT = 120  # секунды
 
 SOCKS5_HOST = settings.REG_SOCKS5_HOST
 SOCKS5_PORT = int(settings.REG_SOCKS5_PORT)
@@ -40,16 +45,15 @@ SOCKS5_PASSWORD = settings.REG_SOCKS5_PASSWORD
 USE_PROXY = bool(settings.REG_USE_PROXY)
 
 # Коды стран — как просил
-COUNTRY_CODES = [117, 34, 56, 49]  # можно сузить в .env при желании
+COUNTRY_CODES = [117, 34, 49]
 
-# Глобальный лимитер: не больше 2 регистраций за 11 минут
+# Лимит SuitePro: 2 регистрации за 11 минут
 _LIMIT_WINDOW_SEC = 11 * 60
 _LIMIT_MAX_REG = 2
 _rate_lock = threading.Lock()
-_rate_timestamps: List[float] = []  # моменты вызовов /accounts/register
+_rate_timestamps: List[float] = []
 
 def _rate_limit_blocking():
-    """Блокирует поток до разрешения делать новый вызов регистрации SuitePro."""
     while True:
         now = time.time()
         with _rate_lock:
@@ -92,6 +96,9 @@ KNOWN_PROVIDERS = {
     'msn.com': {'host': 'outlook.office365.com', 'port': 993, 'ssl': True},
     'gmx.com': {'host': 'imap.gmx.com', 'port': 993, 'ssl': True},
     'gmx.net': {'host': 'imap.gmx.net', 'port': 993, 'ssl': True},
+    'gmx.de':  {'host': 'imap.gmx.net', 'port': 993, 'ssl': True},   # ← добавь это
+    'gmx.at':  {'host': 'imap.gmx.net', 'port': 993, 'ssl': True},   # опционально
+    'gmx.ch':  {'host': 'imap.gmx.net', 'port': 993, 'ssl': True},   # опционально
     'web.de': {'host': 'imap.web.de', 'port': 993, 'ssl': True},
     'mail.com': {'host': 'imap.mail.com', 'port': 993, 'ssl': True},
     'freenet.de': {'host': 'mx.freenet.de', 'port': 993, 'ssl': True},
@@ -104,6 +111,44 @@ GERMAN_FIRST_NAMES = ["Alexander","Andreas","Bernd","Christian","Daniel","David"
 GERMAN_LAST_NAMES = ["Bauer","Beck","Becker","Fischer","Frank","Fuchs","Graf","Hartmann","Hoffmann","Klein","Koch","Krause","Lehmann","Ludwig","Maier","Meyer","Müller","Neumann","Richter","Schmidt","Schneider","Schulz","Schwarz","Wagner","Walter","Weber","Werner","Wolf"]
 
 # --- утилиты ---
+
+def split_e164_phone(phone: str) -> tuple[str, str]:
+    """
+    Разбирает номер в формате +351925432498 / 00351925432498 / 351925432498.
+    Возвращает (countryCallingCode, nationalNumber).
+    """
+    if not phone:
+        return "", ""
+    # убираем всё, кроме цифр
+    digits = re.sub(r"\D", "", phone)
+    # срезаем префикс 00, если есть
+    if digits.startswith("00"):
+        digits = digits[2:]
+
+    # набор реальных телефонных кодов, с которыми мы сталкиваемся
+    known_cc = {
+        "351",  # PT
+        "372",  # EE
+        "49",   # DE
+        "34",   # ES
+        "56",   # (на случай если попадётся CL)
+        "43","41","44","33","39","31","32",
+        "420","421","48","46","47","90",
+        "370","371","373","375","40","359","358","357"
+    }
+
+    # пробуем 3 → 2 → 1 цифру как код страны
+    for k in (3, 2, 1):
+        if len(digits) > k:
+            cc = digits[:k]
+            if cc in known_cc:
+                return cc, digits[k:]
+
+    # если код незнакомый — берём первые 2 как код
+    if len(digits) > 2:
+        return digits[:2], digits[2:]
+    return "", digits
+
 def safe_print(msg: str) -> None:
     log.info(msg)
 
@@ -187,7 +232,7 @@ def create_ssl_ctx(method=None):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         try: ctx.set_ciphers('DEFAULT@SECLEVEL=0')
-        except: 
+        except:
             try: ctx.set_ciphers('ALL')
             except: pass
         return ctx
@@ -382,7 +427,6 @@ def generate_contact_name() -> str:
     return f if t==1 else (f + " " + l[0] + "." if t==2 else f + " " + l)
 
 def get_sms_balance(api_key: str) -> float:
-    import requests
     try:
         r = requests.get(SMS_ACTIVATE_API_BASE_URL, params={"api_key": api_key, "action": "getBalance"}, timeout=30)
         r.raise_for_status()
@@ -393,7 +437,6 @@ def get_sms_balance(api_key: str) -> float:
     return 0.0
 
 def order_phone(api_key: str, max_retries: int = 20) -> Optional[Dict]:
-    import requests
     delay = 0.2
     for attempt in range(1, max_retries+1):
         try:
@@ -403,7 +446,6 @@ def order_phone(api_key: str, max_retries: int = 20) -> Optional[Dict]:
                 "service": "dh",
                 "country": random.choice(COUNTRY_CODES),
             }
-            # оператор не указываем
             r = requests.get(SMS_ACTIVATE_API_BASE_URL, params=params, timeout=30)
             r.raise_for_status()
             body = r.text.strip()
@@ -425,7 +467,6 @@ def order_phone(api_key: str, max_retries: int = 20) -> Optional[Dict]:
     return None
 
 def wait_sms(api_key: str, activation_id: str, max_wait: int = MAX_WAIT_TIME) -> Optional[str]:
-    import requests
     safe_print(f"Waiting SMS (id={activation_id})…")
     start = time.time()
     while time.time() - start < max_wait:
@@ -435,8 +476,12 @@ def wait_sms(api_key: str, activation_id: str, max_wait: int = MAX_WAIT_TIME) ->
             try:
                 data = r.json()
                 if data.get("sms"):
-                    code = data["sms"].get("code") or re.search(r'(\d{6})', data["sms"].get("text","") or "")
-                    return code if isinstance(code, str) else (code.group(1) if code else None)
+                    code = data["sms"].get("code")
+                    if code:
+                        return code
+                    m = re.search(r'(\d{6})', data["sms"].get("text","") or "")
+                    if m:
+                        return m.group(1)
             except Exception:
                 if r.text.startswith("STATUS_OK:"):
                     return r.text.split(":")[1]
@@ -446,23 +491,120 @@ def wait_sms(api_key: str, activation_id: str, max_wait: int = MAX_WAIT_TIME) ->
     return None
 
 def update_activation(api_key: str, activation_id: str, status: int) -> bool:
-    import requests
     try:
         r = requests.get(SMS_ACTIVATE_API_BASE_URL, params={"api_key": api_key,"action":"setStatus","id":activation_id,"status":status}, timeout=30)
         return r.text.startswith("ACCESS_")
     except Exception:
         return False
 
-def initiate_registration(suite_api_key: str, email_address: str) -> Dict:
-    import requests
-    # лимитер на вызов /accounts/register: 2 за 11 минут
-    _rate_limit_blocking()
+# === HTTP-сессия с ретраями для SuitePro ===
+_session = requests.Session()
+_retry = Retry(
+    total=5,
+    connect=5,
+    read=5,
+    status=5,
+    backoff_factor=1.2,
+    status_forcelist=(408, 429, 500, 502, 503, 504, 522, 524),
+    allowed_methods=frozenset(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]),
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=50, pool_maxsize=50)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
 
+_DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8,ru;q=0.7",
+    "Origin": "https://api.suitepro.to",
+    "Referer": "https://api.suitepro.to/",
+    "Content-Type": "application/json",
+}
+
+_SENSITIVE_KEYS = {"password","token","privKey","pubKey","fcmToken","fingerprint"}
+
+def _mask_val(v: str) -> str:
+    if not isinstance(v, str) or not v:
+        return "***"
+    return (v[:2] + "***" + v[-2:]) if len(v) > 6 else "***"
+
+def _mask_dict(d: Dict) -> Dict:
+    try:
+        red = {}
+        for k, v in (d or {}).items():
+            red[k] = _mask_val(v) if k in _SENSITIVE_KEYS else v
+        return red
+    except Exception:
+        return d or {}
+
+def _mask_headers(h: Dict) -> Dict:
+    try:
+        red = dict(h or {})
+        key = red.get("X-API-Key")
+        if key:
+            red["X-API-Key"] = _mask_val(key)
+        return red
+    except Exception:
+        return h or {}
+
+def _log_response_preview(text: str, limit: int = 3000) -> str:
+    if text is None:
+        return ""
+    t = text if isinstance(text, str) else str(text)
+    return t[:limit] + ("…<cut>" if len(t) > limit else "")
+
+def _sp_post(path: str, api_key: str, payload: Dict, timeout: int = SUITEPRO_HTTP_READ_TIMEOUT) -> requests.Response:
+    """
+    POST к SuitePro с ретраями (5xx/429/Cloudflare), бэкоффом и подробным логом.
+    """
+    url = f"{API_BASE_URL}{path}"
+    headers = dict(_DEFAULT_HEADERS)
+    headers["X-API-Key"] = api_key
+
+    masked_payload = _mask_dict(payload)
+    masked_headers = _mask_headers(headers)
+
+    attempt = 0
+    t0 = time.time()
+    while True:
+        attempt += 1
+        log.info("[SuitePro] POST %s attempt=%d headers=%s json=%s",
+                 url, attempt,
+                 json.dumps(masked_headers, ensure_ascii=False),
+                 json.dumps(masked_payload, ensure_ascii=False))
+        try:
+            r = _session.post(url, headers=headers, json=payload,
+                              timeout=(15, timeout))  # (connect, read)
+            body_preview = _log_response_preview(r.text)
+            log.info("[SuitePro] RESP %s %s in %.1f ms: %s",
+                     url, r.status_code, (time.time()-t0)*1000, body_preview)
+
+            if r.status_code >= 500 and "cloudflare" in (r.text or "").lower():
+                if attempt < 5:
+                    time.sleep(1.2 * attempt)
+                    continue
+
+            r.raise_for_status()
+            return r
+
+        except requests.RequestException as e:
+            if attempt >= 5:
+                log.info("[SuitePro] EXC %s after %d attempts: %s", url, attempt, e)
+                raise
+            sleep_s = 1.2 * attempt
+            log.info("[SuitePro] retry %s after error: %s; sleep %.1fs", url, e, sleep_s)
+            time.sleep(sleep_s)
+
+# === ВЗАИМОДЕЙСТВИЕ С SUITEPRO ===
+
+def initiate_registration(suite_api_key: str, email_address: str) -> Dict:
+    _rate_limit_blocking()
     password = generate_password()
     contact = generate_contact_name()
     payload = {"username": email_address, "password": password, "contactName": contact, "accountType": "PRIVATE"}
-    r = requests.post(f"{API_BASE_URL}/accounts/register", headers={"X-API-Key": suite_api_key,"Content-Type":"application/json"}, json=payload, timeout=60)
-    r.raise_for_status()
+    r = _sp_post("/accounts/register", suite_api_key, payload, timeout=SUITEPRO_HTTP_READ_TIMEOUT)
     data = r.json()
     data["username"] = email_address
     data["password"] = password
@@ -470,10 +612,17 @@ def initiate_registration(suite_api_key: str, email_address: str) -> Dict:
     return data
 
 def start_phone_verification(suite_api_key: str, reg_data: Dict, verify_url: str, phone: str) -> Dict:
-    import requests
-    # код страны выбираем из заданного списка
-    cc = str(random.choice(COUNTRY_CODES))
-    national = phone.replace(cc, "", 1) if phone.startswith(cc) else phone
+    """
+    Старт верификации телефона — код страны берём из номера (E.164), а не из ID SMS-Activate.
+    Покупка номера по случайным ID стран остаётся как была (в order_phone).
+    """
+    cc, national = split_e164_phone(phone)
+    if not cc or not national:
+        raise ValueError(f"Не удалось распарсить номер: {phone}")
+
+    # для ясности в лог
+    safe_print(f"[DEBUG] parsed phone: raw=+{phone} -> cc={cc}, national={national}")
+
     payload = {
         "countryCallingCode": cc,
         "nationalNumber": national,
@@ -484,15 +633,16 @@ def start_phone_verification(suite_api_key: str, reg_data: Dict, verify_url: str
         "proxyURL": "",
         "installedAt": reg_data["installedAt"],
         "previousSession": reg_data.get("session", ""),
-        "lastProfileInterval": reg_data.get("lastProfileInterval", 0)
+        "lastProfileInterval": reg_data.get("lastProfileInterval", 0),
     }
-    r = requests.post(f"{API_BASE_URL}/accounts/register/phone/start", headers={"X-API-Key": suite_api_key,"Content-Type":"application/json"}, json=payload, timeout=60)
-    r.raise_for_status()
-    data = r.json(); data["nationalNumber"] = national
+
+    r = _sp_post("/accounts/register/phone/start", suite_api_key, payload, timeout=SUITEPRO_HTTP_READ_TIMEOUT)
+    data = r.json()
+    data["nationalNumber"] = national
     return data
 
+
 def complete_phone_verification(suite_api_key: str, reg_data: Dict, verify_url: str, code: str) -> Dict:
-    import requests
     payload = {
         "username": reg_data["username"],
         "password": reg_data["password"],
@@ -509,10 +659,11 @@ def complete_phone_verification(suite_api_key: str, reg_data: Dict, verify_url: 
         "lastProfileInterval": reg_data.get("lastProfileInterval", 0),
         "autoLogin": True
     }
-    r = requests.post(f"{API_BASE_URL}/accounts/register/phone/complete", headers={"X-API-Key": suite_api_key,"Content-Type":"application/json"}, json=payload, timeout=60)
+    r = _sp_post("/accounts/register/phone/complete", suite_api_key, payload, timeout=SUITEPRO_HTTP_READ_TIMEOUT)
     log.info("Complete status for %s: %s", reg_data["username"], r.status_code)
-    r.raise_for_status()
     return r.json()
+
+# === Остальной пайп ===
 
 def save_account_info(email_addr: str, data: Dict, phone_info: Dict|None = None, st: IMAPSettings|None = None):
     info = {
@@ -535,41 +686,71 @@ def save_account_info(email_addr: str, data: Dict, phone_info: Dict|None = None,
 
 def _process_single(suite_key: str, sms_key: str, acc: EmailAccount) -> bool:
     activation_id = None
+    email_addr = acc.email
     try:
+        # STEP 1 — IMAP
+        safe_print(f"[STEP 1] {email_addr} — ищу IMAP настройки…")
         if not acc.imap_settings:
-            st = find_imap_settings_fast(acc.email, acc.password)
+            st = find_imap_settings_fast(email_addr, acc.password)
             if not st:
-                safe_print(f"[IMAP] settings not found: {acc.email}")
+                safe_print(f"[STEP 1] ✗ IMAP не найден для {email_addr}")
                 return False
             acc.imap_settings = st
-        reg_data = initiate_registration(suite_key, acc.email)
-        safe_print(f"[REG] initiated for {acc.email}")
-        verify_url = wait_for_verification_email(acc.imap_settings, timeout=MAX_WAIT_TIME)
+        st = acc.imap_settings
+        safe_print(f"[STEP 1] ✓ IMAP: {st.host}:{st.port} (SSL={st.ssl}, method={st.ssl_method})")
+
+        # STEP 2 — REGISTER
+        safe_print(f"[STEP 2] ▶️ Регистрирую в SuitePro: {email_addr}…")
+        reg_data = initiate_registration(suite_key, email_addr)
+        safe_print(f"[STEP 2] ✓ Регистрация инициирована: {email_addr}")
+
+        # STEP 3 — EMAIL
+        safe_print(f"[STEP 3] ⏳ Жду письмо активации Kleinanzeigen: {email_addr}…")
+        verify_url = wait_for_verification_email(st, timeout=MAX_WAIT_TIME)
         if not verify_url:
-            safe_print(f"[EMAIL] no verify mail: {acc.email}")
+            safe_print(f"[STEP 3] ✗ Не пришло письмо: {email_addr}")
             return False
+        safe_print(f"[STEP 3] ✓ Ссылка найдена: {verify_url}")
+
+        # STEP 4 — SMS getNumber
+        safe_print(f"[STEP 4] ▶️ Заказываю номер SMS-Activate: {email_addr}…")
         phone = order_phone(sms_key)
         if not phone:
-            safe_print("[SMS] no phone number")
+            safe_print(f"[STEP 4] ✗ Нет доступных номеров")
             return False
         activation_id = phone["activation_id"]
+        safe_print(f"[STEP 4] ✓ Номер: +{phone['phone_number']} (id={activation_id})")
         update_activation(sms_key, activation_id, 1)
+
+        # STEP 5 — phone/start
+        safe_print(f"[STEP 5] ▶️ Стартую phone/start: {email_addr}…")
         start_phone_verification(suite_key, reg_data, verify_url, phone["phone_number"])
+        safe_print(f"[STEP 5] ✓ phone/start отправлен")
+
+        # STEP 6 — wait SMS
+        safe_print(f"[STEP 6] ⏳ Жду SMS-код: {email_addr}…")
         code = wait_sms(sms_key, activation_id, MAX_WAIT_TIME)
         if not code:
             update_activation(sms_key, activation_id, 8)
-            safe_print("[SMS] code not received")
+            safe_print(f"[STEP 6] ✗ Код не получен")
             return False
+        safe_print(f"[STEP 6] ✓ Код: {code}")
+
+        # STEP 7 — phone/complete
+        safe_print(f"[STEP 7] ▶️ Завершаю регистрацию: {email_addr}…")
         complete_phone_verification(suite_key, reg_data, verify_url, code)
         update_activation(sms_key, activation_id, 6)
-        save_account_info(acc.email, reg_data, phone, acc.imap_settings)
+        save_account_info(email_addr, reg_data, phone, st)
+
         global success_count
         with success_count_lock:
             success_count += 1
-        safe_print(f"[REG] success {acc.email}")
+
+        safe_print(f"[DONE] ✅ {email_addr} зарегистрирован")
         return True
+
     except Exception as e:
-        safe_print(f"[REG] failed {acc.email}: {e}")
+        safe_print(f"[ERROR] {email_addr}: {e}")
         if activation_id:
             update_activation(sms_key, activation_id, 8)
         return False
