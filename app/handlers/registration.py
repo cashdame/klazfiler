@@ -1,7 +1,8 @@
 # app/handlers/registration.py
-import os
-import tempfile
-from io import BytesIO
+# v2: спрашиваем количество, арендуем почты на SMS-Activate и запускаем регистрацию
+import re
+import asyncio
+from typing import Callable, Awaitable
 
 from aiogram import Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
@@ -10,17 +11,19 @@ from aiogram.fsm.state import StatesGroup, State
 
 from app.keyboards import main_keyboard
 from app.logging_setup import get_logger
-from app.tools.registration_bot import run_registration_batch
+# ВАЖНО: функция уже должна быть в app/tools/registration_bot.py (v2)
+from app.tools.registration_bot import run_registration_rent_batch
 
 router = Router()
-log = get_logger("klazfiler.registration")
+log = get_logger("klazfiler.registration.v2")
 
 
 class RegStates(StatesGroup):
-    waiting_file = State()
+    waiting_count = State()
 
 
 def reg_keyboard() -> ReplyKeyboardMarkup:
+    # Минималистично: только «Назад»
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="⬅️ Назад")]],
         resize_keyboard=True,
@@ -28,147 +31,105 @@ def reg_keyboard() -> ReplyKeyboardMarkup:
 
 
 async def _switch_to(target: str, message: Message, state: FSMContext):
-    # обнуляем состояние и уходим в нужный раздел ленивым импортом
     await state.clear()
-    await message.answer("Переключаюсь…")
-    if target == "list_accounts":
-        from app.handlers.list_accounts import list_accounts_open
-        await list_accounts_open(message)
-    elif target == "add_account":
-        from app.handlers.add_account import addacc_enter
-        await addacc_enter(message, state)
-    elif target == "archive":
-        from app.handlers.archive import open_archive
-        await open_archive(message)
-    elif target == "quick":
-        from app.handlers.menu import quick_publish
-        await quick_publish(message)
-    elif target == "filters":
-        from app.handlers.menu import filters
-        await filters(message)
-    elif target == "test":
-        from app.handlers.menu import test_section
-        await test_section(message)
-    elif target == "back":
-        from app.handlers.menu import back_to_menu
-        await back_to_menu(message)
-
-
-_SWITCH_MAP = {
-    "👥 Список аккаунтов": "list_accounts",
-    "Список аккаунтов": "list_accounts",
-    "➕ Добавить аккаунт": "add_account",
-    "Добавить аккаунт": "add_account",
-    "🗂 Архив товаров": "archive",
-    "Архив товаров": "archive",
-    "⚡ Быстрая публикация": "quick",
-    "Быстрая публикация": "quick",
-    "⚙️ Фильтры": "filters",
-    "Фильтры": "filters",
-    "🔢 123": "test",
-    "123": "test",
-    "⬅️ Назад": "back",
-    "Назад": "back",
-}
+    if target == "back":
+        await message.answer("Меню:", reply_markup=main_keyboard())
+    else:
+        await message.answer("Меню:", reply_markup=main_keyboard())
 
 
 @router.message(F.text.in_({"📝 Регистрация", "Регистрация"}))
 async def registration_entry(message: Message, state: FSMContext):
-    await state.set_state(RegStates.waiting_file)
-    log.info("enter registration: waiting_file")
+    # Старт v2: спрашиваем, сколько почт арендовать
+    await state.set_state(RegStates.waiting_count)
+    log.info("enter registration v2: waiting_count")
     await message.answer(
-        "Пришли .txt со списком почт (email:pass, по строкам или через |).\n"
-        "Отправь как документ (скрепка).",
+        "Сколько почт арендовать под регистрацию? Введи число, например 4.",
         reply_markup=reg_keyboard(),
     )
 
 
-# 1) СНАЧАЛА документы — иначе текстовый перехватывает событие
-@router.message(RegStates.waiting_file, F.document)
-async def registration_file_received(message: Message, state: FSMContext):
-    log.info("registration: document handler triggered")
-    document = message.document
-    file_name = (document.file_name or "mails.txt")
-    lower_name = file_name.lower()
-    mime = (document.mime_type or "").lower()
-    size_meta = getattr(document, "file_size", None)
-    log.info("document meta: name=%s mime=%s size=%s", file_name, mime, size_meta)
-
-    # принимаем .txt и вообще любой text/*
-    if not (lower_name.endswith(".txt") or mime.startswith("text/")):
-        await message.answer("Нужен текстовый файл .txt. Пришли ещё раз как документ.")
+@router.message(RegStates.waiting_count, F.text.regexp(r"^\d{1,3}$"))
+async def handle_count(message: Message, state: FSMContext):
+    await state.clear()
+    count = int(message.text)
+    if count <= 0:
+        await message.answer("Нужно положительное число. Попробуй ещё раз.")
+        await state.set_state(RegStates.waiting_count)
         return
 
-    try:
-        await message.answer("⬇️ Скачиваю файл…")
+    # создаём первое сообщение со статусом
+    status_msg = await message.answer(f"⏳ Покупаю {count} почт...")
 
-        # 1) пробуем нативную загрузку (aiogram v3)
+    start_time = asyncio.get_event_loop().time()
+    status = {
+        "total": count,
+        "done": 0,
+        "failed": 0,
+        "stage": "инициализация",
+    }
+
+    async def notify(text: str) -> None:
+        """редактирует одно сообщение по мере прогресса"""
+        nonlocal status
         try:
-            with tempfile.TemporaryDirectory(prefix="reg_") as tmpdir:
-                local_path = os.path.join(
-                    tmpdir, lower_name if lower_name.endswith(".txt") else "mails.txt"
-                )
-                await message.bot.download(document, destination=local_path)
-                size = os.path.getsize(local_path)
-                log.info("file saved: %s (%d bytes)", local_path, size)
+            if "куплено" in text.lower():
+                status["stage"] = "куплено"
+            elif "init" in text.lower() or "регистрирую" in text.lower():
+                status["stage"] = "регистрирую"
+            elif "ссылка" in text.lower():
+                status["stage"] = "письмо получено"
+            elif "sms" in text.lower():
+                status["stage"] = "смс код"
+            elif text.startswith("✅"):
+                status["done"] += 1
+            elif "❌" in text:
+                status["failed"] += 1
 
-                async def notify(text: str) -> None:
-                    try:
-                        await message.answer(text)
-                    except Exception as e:
-                        log.warning("notify failed: %s", e)
+            elapsed = int(asyncio.get_event_loop().time() - start_time)
+            mins, secs = divmod(elapsed, 60)
+            summary = (
+                f"Куплено: {status['total']} почт\n"
+                f"Готово: {status['done']} / Ошибок: {status['failed']}\n"
+                f"Стадия: {status['stage']}\n"
+                f"⏱ Время: {mins}м {secs}с"
+            )
+            await status_msg.edit_text(summary)
+        except Exception as e:
+            log.warning("notify edit failed: %s", e)
 
-                log.info("calling run_registration_batch(file_path=%s)", local_path)
-                await notify("✅ Файл получен. Запускаю регистрацию…")
-                await run_registration_batch(file_path=local_path, notify=notify)
-                log.info("run_registration_batch finished")
-
-        # 2) fallback для пересланных/нестандартных документов
-        except Exception as e1:
-            log.warning("download(document, ...) failed, fallback to get_file: %s", e1)
-            tg_file = await message.bot.get_file(document.file_id)
-            buf = BytesIO()
-            await message.bot.download_file(tg_file.file_path, buf)
-            buf.seek(0)
-
-            with tempfile.TemporaryDirectory(prefix="reg_") as tmpdir:
-                local_path = os.path.join(
-                    tmpdir, lower_name if lower_name.endswith(".txt") else "mails.txt"
-                )
-                with open(local_path, "wb") as f:
-                    f.write(buf.read())
-                size = os.path.getsize(local_path)
-                log.info("file saved via fallback: %s (%d bytes)", local_path, size)
-
-                async def notify(text: str) -> None:
-                    try:
-                        await message.answer(text)
-                    except Exception as e:
-                        log.warning("notify failed: %s", e)
-
-                log.info("calling run_registration_batch(file_path=%s)", local_path)
-                await message.answer("✅ Файл получен. Запускаю регистрацию…")
-                await run_registration_batch(file_path=local_path, notify=notify)
-                log.info("run_registration_batch finished (fallback)")
-
+    try:
+        await run_registration_rent_batch(count=count, notify=notify)
     except Exception as e:
-        log.exception("Ошибка при скачивании/обработке файла: %s", e)
-        await message.answer(f"❌ Не удалось обработать файл: {e}")
+        log.exception("run_registration_rent_batch error: %s", e)
+        await status_msg.edit_text(f"❌ Ошибка запуска регистрации: {e}")
+        return
 
-    # остаёмся в режиме загрузки — можно кидать следующий .txt
-    await state.set_state(RegStates.waiting_file)
+    elapsed = int(asyncio.get_event_loop().time() - start_time)
+    mins, secs = divmod(elapsed, 60)
+    await status_msg.edit_text(
+        f"✅ Готово!\n"
+        f"Куплено: {status['total']} почт\n"
+        f"Зарегистрировано: {status['done']}\n"
+        f"Не удалось: {status['failed']}\n"
+        f"⏱ Всего заняло: {mins}м {secs}с"
+    )
+
+    # можно сразу предложить повторить
+    await state.set_state(RegStates.waiting_count)
     await message.answer(
-        "Если нужно — пришли ещё один .txt.\nИли «⬅️ Назад» для выхода.",
+        "Хочешь ещё? Введи новое число или «⬅️ Назад».",
         reply_markup=reg_keyboard(),
     )
 
-
-# 2) ПОТОМ текст — и только если это не документ
-@router.message(RegStates.waiting_file, ~F.document, F.text.cast(str).as_("text"))
-async def registration_switch_or_prompt(message: Message, state: FSMContext, text: str):
-    log.info("registration: text handler triggered")
-    target = _SWITCH_MAP.get(text)
-    if target:
-        await _switch_to(target, message, state)
-    else:
-        await message.answer("Жду .txt-файл как документ. Или «⬅️ Назад».")
+@router.message(RegStates.waiting_count)
+async def registration_switch_or_prompt(message: Message, state: FSMContext):
+    # Поддержка «Назад», всё остальное — просьба ввести число
+    if message.text in {"⬅️ Назад", "Назад"}:
+        await _switch_to("back", message, state)
+        return
+    if re.fullmatch(r"\d{1,3}", message.text or ""):
+        # На всякий случай — если регексп-селектор не сработал
+        await handle_count(message, state)
+        return
+    await message.answer("Введи просто число, например 2. Или «⬅️ Назад».")
