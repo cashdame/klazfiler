@@ -1,23 +1,17 @@
-# app/services/suitepro_client.py
+# app/services/add.py
 # -*- coding: utf-8 -*-
 """
-Async‑клиент под SuitePro API с функцией публикации объявления и вспомогательными методами:
+Async-клиент SuitePro:
 - add_ad(payload)
 - upload_images(username, files)
 - list_categories()
 - get_category_metadata(category_id)
-
-Особенности:
-- aiohttp, экспоненциальные ретраи на 5xx/429/сетевых ошибках.
-- Авторизация: Bearer (по умолчанию) или X-API-Key через settings.SUITEPRO_AUTH_SCHEME.
-- Базовые URL: берём из settings: SUITEPRO_CLASSIFIEDS_URL/IMAGES_URL/CATEGORIES_URL/METADATA_URL,
-  иначе строим от SUITEPRO_API_URL.
-- Лёгкая валидация payload для Add Ad, чистка None, обрезка title до 65 символов.
-- Унифицированный ответ: (ok: bool, data: dict|list|str|None, status: int).
+- publish_ad(...) — фасад
 """
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -32,31 +26,32 @@ log = logging.getLogger("klazfiler.suitepro")
 JsonDict = Dict[str, Any]
 Result = Tuple[bool, Any, int]
 
-# -------------------- URL helpers --------------------
+# ---------- URL helpers ----------
+
+_MAX_LOG = 8000
+def _pretty(obj):
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(obj)
 
 def _base(api_path: str) -> str:
     base = (getattr(settings, "SUITEPRO_API_URL", "") or "").rstrip("/") + "/"
     return urljoin(base, api_path.lstrip("/"))
 
-
 def _classifieds_url() -> str:
     return (getattr(settings, "SUITEPRO_CLASSIFIEDS_URL", "") or _base("classifieds/")).rstrip("/") + "/"
-
 
 def _images_url() -> str:
     return (getattr(settings, "SUITEPRO_IMAGES_URL", "") or _base("classifieds/images")).rstrip("/")
 
-
 def _categories_url() -> str:
     return (getattr(settings, "SUITEPRO_CATEGORIES_URL", "") or _base("categories")).rstrip("/")
-
 
 def _metadata_url() -> str:
     return (getattr(settings, "SUITEPRO_METADATA_URL", "") or _base("metadata")).rstrip("/")
 
-
-# -------------------- auth/timeout/retries --------------------
-
+# ---------- auth/timeout/retry ----------
 def _headers_json() -> Dict[str, str]:
     api_key = (getattr(settings, "SUITEPRO_API_KEY", "") or "").strip()
     scheme = (getattr(settings, "SUITEPRO_AUTH_SCHEME", "Bearer") or "Bearer").strip().lower()
@@ -67,13 +62,10 @@ def _headers_json() -> Dict[str, str]:
         h["Authorization"] = f"Bearer {api_key}"
     return h
 
-
 def _headers_multipart() -> Dict[str, str]:
     h = _headers_json().copy()
-    # Уберём Content-Type, его выставит aiohttp при multipart
     h.pop("Content-Type", None)
     return h
-
 
 def _timeout() -> int:
     try:
@@ -81,84 +73,101 @@ def _timeout() -> int:
     except Exception:
         return 60
 
-
 def _retries() -> int:
     try:
         return int(getattr(settings, "API_RETRIES", 3))
     except Exception:
         return 3
 
-
 async def _req_with_retry(session: aiohttp.ClientSession, method: str, url: str, **kwargs) -> Tuple[int, Any]:
     retries = _retries()
     backoff = 1.0
     last_exc: Optional[BaseException] = None
 
-    for attempt in range(retries + 1):
+    # Лог исходящего запроса
+    out_json = kwargs.get("json")
+    out_data = kwargs.get("data")
+    if out_json is not None:
+        log.info("[HTTP-REQ] %s %s\n%s", method, url, _pretty(out_json)[:_MAX_LOG])
+    elif out_data is not None:
+        log.info("[HTTP-REQ] %s %s (multipart/form-data)", method, url)
+    else:
+        log.info("[HTTP-REQ] %s %s", method, url)
+
+    for attempt in range(1, retries + 2):
+        t0 = time.monotonic()
         try:
             async with session.request(method, url, timeout=_timeout(), **kwargs) as resp:
+                dt = time.monotonic() - t0
                 status = resp.status
                 text = await resp.text()
+
                 try:
-                    data = json.loads(text) if text else (await resp.read() or None)
+                    data = json.loads(text) if text else {}
                 except Exception:
                     data = text
 
+                log.info("[HTTP-RESP] %s %s -> %s in %.3fs", method, url, status, dt)
+                # Тело ответа
+                body = data if isinstance(data, (dict, list)) else text
+                if body:
+                    log.info("[HTTP-BODY]\n%s", _pretty(body)[:_MAX_LOG])
+
                 if 200 <= status < 300:
                     return status, data
-                # 4xx не ретраим, кроме 429
                 if 400 <= status < 500 and status != 429:
                     return status, data
-                log.warning("HTTP %s %s -> %s, attempt %s/%s", method, url, status, attempt + 1, retries)
+
+                log.warning("HTTP %s %s -> %s, retry %s/%s", method, url, status, attempt, retries+1)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_exc = e
-            log.warning("HTTP %s %s exception: %s, attempt %s/%s", method, url, e, attempt + 1, retries)
+            log.warning("HTTP %s %s exception: %s, retry %s/%s", method, url, e, attempt, retries+1)
+
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 10)
 
-    # Все попытки исчерпаны
     return -1, {"error": "request failed", "exception": str(last_exc) if last_exc else None}
 
 
-# -------------------- core calls --------------------
-
+# ---------- core calls ----------
 async def add_ad(payload: JsonDict) -> Result:
-    """POST /classifieds/ — публикация объявления.
-    Обязательные поля: account, contact, postcode, title, description, categoryId, priceType.
-    priceType: SPECIFIED_AMOUNT или PLEASE_CONTACT. Если SPECIFIED_AMOUNT — желательно amount.
-    Возвращает (ok, data, status) где ok = body.get("added") is True.
-    """
     required = ["account", "contact", "postcode", "title", "description", "categoryId", "priceType"]
     missing = [k for k in required if not payload.get(k)]
     if missing:
+        log.error("[Publish] missing required: %s", ", ".join(missing))
         return False, {"error": f"missing required fields: {', '.join(missing)}"}, 0
 
-    pt = payload.get("priceType")
-    if pt not in ("SPECIFIED_AMOUNT", "PLEASE_CONTACT"):
-        return False, {"error": "priceType must be 'SPECIFIED_AMOUNT' or 'PLEASE_CONTACT'"}, 0
-
-    # Обрезаем title до 65 символов (часто требуется этим API)
     if isinstance(payload.get("title"), str):
         payload["title"] = payload["title"].strip()[:65]
 
-    # Уберём None
     clean = {k: v for k, v in payload.items() if v is not None}
 
-    url = _classifieds_url()  # оканчивается на /classifieds/
+    log.info("[Publish] payload:")
+    for k in ("account", "contact", "postcode", "title", "categoryId", "priceType", "amount"):
+        if k in clean:
+            log.info("[Publish]  %s = %s", k, clean[k])
+    log.info("[Publish]  images = %s", len(clean.get("images") or []))
+    if "shippingOptions" in clean:
+        log.info("[Publish]  shippingOptions = %s", clean["shippingOptions"])
+    if "shippingPrice" in clean:
+        log.info("[Publish]  shippingPrice = %s", clean["shippingPrice"])
+    if "threatMetrix" in clean:
+        log.info("[Publish]  threatMetrix = %s", clean["threatMetrix"])
+
+    url = _classifieds_url()
     headers = _headers_json()
+    log.info("[Publish] POST %s", url)
 
     async with aiohttp.ClientSession(headers=headers) as sess:
         status, data = await _req_with_retry(sess, "POST", url, json=clean)
 
     ok = bool(isinstance(data, dict) and data.get("added") is True and 200 <= status < 300)
+    log.info("[Publish] result ok=%s status=%s", ok, status)
     return ok, data, status
 
 
 async def upload_images(username: Optional[str], files: Iterable[Union[str, bytes]]) -> Result:
-    """POST /classifieds/images — загрузка изображений.
-    files: список путей к файлам или байтов.
-    Возвращает (ok, [urls], status).
-    """
+    """POST /classifieds/images"""
     url = _images_url()
     headers = _headers_multipart()
 
@@ -169,7 +178,6 @@ async def upload_images(username: Optional[str], files: Iterable[Union[str, byte
     idx = 0
     for f in files:
         if isinstance(f, str):
-            # путь к файлу
             form.add_field("images", open(f, "rb"), filename=f.split("/")[-1].split("\\")[-1], content_type="image/jpeg")
         else:
             form.add_field("images", f, filename=f"img_{idx}.jpg", content_type="image/jpeg")
@@ -179,11 +187,13 @@ async def upload_images(username: Optional[str], files: Iterable[Union[str, byte
         status, data = await _req_with_retry(sess, "POST", url, data=form)
 
     ok = bool(status == 200 and isinstance(data, list))
+    if ok:
+        log.info("[Images] uploaded %s images", len(data))
+    else:
+        log.info("[Images] upload failed: %s %s", status, str(data)[:400])
     return ok, data, status
 
-
 async def list_categories() -> Result:
-    """GET /categories — список категорий."""
     url = _categories_url()
     headers = _headers_json()
     async with aiohttp.ClientSession(headers=headers) as sess:
@@ -191,25 +201,19 @@ async def list_categories() -> Result:
     ok = bool(200 <= status < 300 and isinstance(data, list))
     return ok, data, status
 
-
 async def get_category_metadata(category_id: str) -> Result:
-    """GET /metadata?id=... — метаданные категории."""
     if not category_id:
         return False, {"error": "category_id is required"}, 0
-
     base = _metadata_url()
     sep = "&" if "?" in base else "?"
     url = f"{base}{sep}{urlencode({'id': category_id})}"
-
     headers = _headers_json()
     async with aiohttp.ClientSession(headers=headers) as sess:
         status, data = await _req_with_retry(sess, "GET", url)
     ok = bool(200 <= status < 300 and isinstance(data, dict))
     return ok, data, status
 
-
-# -------------------- удобный фасад публикации --------------------
-
+# ---------- фасад ----------
 async def publish_ad(
     account: str,
     contact: str,
@@ -227,54 +231,20 @@ async def publish_ad(
     shipping_price: Optional[int] = None,
     threat_metrix: Optional[bool] = None,
 ) -> Result:
-    """
-    Высокоуровневая обёртка над add_ad: принимает параметры по отдельности,
-    собирает payload и вызывает add_ad.
-    """
     payload: JsonDict = {
         "account": account,
         "contact": contact,
         "postcode": postcode,
         "title": title,
         "description": description,
-        "categoryId": category_id,
-        "priceType": price_type,
+        "categoryId": category_id,          # ✅ исправлено
+        "priceType": price_type,            # ✅ исправлено
         "imprint": imprint,
-        "amount": amount,
+        "amount": float(amount or 0),       # ✅ float
         "attributes": attributes or {},
         "images": images or [],
-        "shippingOptions": shipping_options or [],
-        "shippingPrice": shipping_price,
-        "threatMetrix": threat_metrix,
+        "shippingOptions": shipping_options or [],  # ✅ исправлено
+        "shippingPrice": shipping_price or 0,       # ✅ исправлено
+        "threatMetrix": threat_metrix is True,       # ✅ исправлено
     }
     return await add_ad(payload)
-
-
-# -------------------- примеры использования --------------------
-if __name__ == "__main__":
-    async def _demo():
-        ok1, cats, s1 = await list_categories()
-        print("categories:", ok1, s1, type(cats))
-
-        ok2, meta, s2 = await get_category_metadata("230")
-        print("metadata:", ok2, s2, isinstance(meta, dict))
-
-        # Загрузка локальных файлов
-        # ok3, urls, s3 = await upload_images("cash", ["/path/to/1.jpg", "/path/to/2.jpg"])
-        # print("images:", ok3, s3, urls)
-
-        ok4, data4, s4 = await publish_ad(
-            account="acc01",
-            contact="+4912345678",
-            postcode="20095",
-            title="Demo title that may be trimmed to sixty five characters max :)",
-            description="Demo desc",
-            category_id="240",
-            price_type="PLEASE_CONTACT",
-            imprint="",
-            attributes={"condition": "used"},
-            images=["https://domain.com/img1.jpg"],
-        )
-        print("publish:", ok4, s4, data4)
-
-    asyncio.run(_demo())

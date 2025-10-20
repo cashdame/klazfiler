@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # SuitePro
     SUITEPRO_API_URL: str = Field(default="https://api.suitepro.to")
     SUITEPRO_API_KEY: str = Field(default="")
+    SUITEPRO_AUTH_SCHEME: str = Field(default="x-api-key", env="SUITEPRO_AUTH_SCHEME")
 
     # Явные эндпойнты (можешь переопределить в .env)
     SUITEPRO_CATEGORIES_URL: str | None = None
