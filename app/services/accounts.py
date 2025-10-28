@@ -20,8 +20,43 @@ def _headers() -> dict[str, str]:
     }
 
 
-async def list_accounts(cursor: int = 0, limit: int = 12) -> Tuple[int, Any]:
-    params = {"cursor": cursor, "limit": limit}
+async def list_accounts(
+    cursor: int = 0,
+    limit: int = 12,
+    search: str | None = None,
+    login_status: str | None = None,
+    sort_by: str = "creationDate",      # Сортировка по дате создания
+    sort_order: str = "asc"             # От старых к новым (asc = ascending)
+) -> Tuple[int, Any]:
+    """
+    Получает список аккаунтов с пагинацией.
+    
+    Args:
+        cursor: Позиция для пагинации
+        limit: Количество аккаунтов на страницу
+        search: Поиск по username
+        login_status: Фильтр по статусу входа
+        sort_by: Поле для сортировки (creationDate, username, id, adsCount, etc.)
+        sort_order: Порядок сортировки ("asc" = от старых к новым, "desc" = от новых к старым)
+    
+    Returns:
+        Tuple[status_code, response_data]
+    
+    По умолчанию: сортирует от СТАРЫХ к НОВЫМ по дате создания
+    """
+    params = {
+        "cursor": cursor,
+        "limit": limit,
+        "sortBy": sort_by,
+        "sortOrder": sort_order
+    }
+    
+    # Добавляем опциональные параметры
+    if search:
+        params["search"] = search
+    if login_status:
+        params["loginStatus"] = login_status
+    
     timeout = aiohttp.ClientTimeout(total=settings.API_TIMEOUT)
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=_headers()) as s:

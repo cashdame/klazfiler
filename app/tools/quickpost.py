@@ -19,6 +19,7 @@ SUITEPRO_API_KEY = settings.SUITEPRO_API_KEY
 SUITEPRO_CATEGORIES_URL = settings.categories_url
 SUITEPRO_METADATA_URL = settings.metadata_url
 SUITEPRO_CLASSIFIEDS_URL = settings.classifieds_url
+SUITEPRO_RESERVE_URL = settings.classifieds_url.rstrip("/classifieds") + "/classifieds/reserve"  # URL для резервирования
 
 OPENAI_API_BASE = settings.OPENAI_API_BASE.rstrip("/")
 OPENAI_API_KEY = (settings.OPENAI_API_KEY or "").strip()
@@ -330,92 +331,190 @@ def build_attributes_payload(ad_obj: Dict, attr_schema: List[Dict]) -> Dict:
     ]
     return oa_chat_json(messages)
 
+# ==== Reserve Ad ====
+def reserve_ad(username: str, ad_id: str) -> bool:
+    """
+    Резервирует объявление.
+    
+    Args:
+        username: email/username аккаунта
+        ad_id: ID объявления
+        
+    Returns:
+        True если успешно зарезервировано, False иначе
+    """
+    try:
+        payload = {
+            "username": username,
+            "id": ad_id
+        }
+        
+        logger.info(f"[Reserve] Reserving ad {ad_id} for {username}")
+        r = _req_with_retry("POST", SUITEPRO_RESERVE_URL, headers=HEADERS_SUITE, json=payload)
+        
+        if r.status_code == 200:
+            logger.info(f"[Reserve] ✅ Successfully reserved {ad_id}")
+            return True
+        else:
+            logger.warning(f"[Reserve] ❌ Failed to reserve {ad_id}: HTTP {r.status_code}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"[Reserve] Error reserving {ad_id}: {e}")
+        return False
+
 # ==== Telegram handler ====
 async def quickpost_entry(message: types.Message):
-    await message.answer("⚡ Быстрая публикация: запускаю…")
+    """
+    Быстрая публикация на ВСЕХ аккаунтах без объявлений.
+    """
+    await message.answer("⚡ Быстрая публикация: ищу пустые аккаунты…")
 
-    # 1) Аккаунт
+    # 1) Получаем ВСЕ аккаунты
     try:
         accounts = await _fetch_all_accounts()
         candidates = _filter_accounts_no_ads(accounts)
     except Exception as e:
         logger.error(f"[QuickPost] accounts error: {e}")
-        await message.answer("Не смог получить список аккаунтов.")
+        await message.answer("❌ Не смог получить список аккаунтов.")
         return
+    
     if not candidates:
-        await message.answer("Нет подходящих аккаунтов: нужен логин, верификация и 0 объявлений.")
+        await message.answer("✅ Нет пустых аккаунтов! Все уже имеют объявления.")
         return
-    acc = random.choice(candidates)
-    email = acc.get("email") or acc.get("username") or acc.get("id", "unknown")
+    
+    # Сообщаем сколько нашли
+    await message.answer(
+        f"📊 Найдено <b>{len(candidates)}</b> пустых аккаунтов.\n"
+        f"🚀 Начинаю публикацию на всех...\n\n"
+        f"⏳ Это займёт ~{len(candidates) * 3} секунд."
+    )
 
-    # 2) Категория
+    # 2) Получаем категории один раз
     try:
         cmap = fetch_category_map_leaf_only()
     except Exception as e:
         logger.error(f"[QuickPost] categories error: {e}")
-        await message.answer("Не смог получить категории.")
+        await message.answer("❌ Не смог получить категории.")
         return
+    
     ids = sorted(cmap.keys())
-    cat_id = FIXED_CATEGORY_ID if CATEGORY_STRATEGY == "fixed" and FIXED_CATEGORY_ID in cmap else random.choice(ids)
-    cat_name = cmap.get(cat_id, "Kategorie")
+    
+    # Счётчики
+    success_count = 0
+    fail_count = 0
+    results = []
 
-    # 3) Метаданные -> схема атрибутов
-    meta = fetch_category_metadata(cat_id)
-    schema = extract_attribute_schema(meta)
+    # 3) Публикуем на КАЖДОМ аккаунте
+    for idx, acc in enumerate(candidates, start=1):
+        email = acc.get("email") or acc.get("username") or acc.get("id", "unknown")
+        
+        try:
+            # Выбираем случайную категорию для каждого аккаунта
+            cat_id = FIXED_CATEGORY_ID if CATEGORY_STRATEGY == "fixed" and FIXED_CATEGORY_ID in cmap else random.choice(ids)
+            cat_name = cmap.get(cat_id, "Kategorie")
 
-    # 4) Объявление + атрибуты
-    banned: List[str] = []
-    ad_obj = build_ad_payload(cat_id, cat_name, banned) or {}
-    if ad_obj.get("category_id") != cat_id or not ad_obj.get("title") or not ad_obj.get("description"):
-        ad_obj = {
-            "title": f"{cat_name} – guter Zustand",
-            "description": "Privatverkauf. Abholung nach Absprache. Keine Garantie.",
-            "price": random.randint(MIN_PRICE, MAX_PRICE),
-            "brand": "Generic",
-            "category_id": cat_id,
-        }
+            # Метаданные
+            meta = fetch_category_metadata(cat_id)
+            schema = extract_attribute_schema(meta)
 
-    attrs_ai = build_attributes_payload(ad_obj, schema) if schema else {}
-    if not isinstance(attrs_ai, dict):
-        attrs_ai = {}
-    attrs = fill_required_attributes(schema, attrs_ai)
+            # Объявление
+            banned: List[str] = []
+            ad_obj = build_ad_payload(cat_id, cat_name, banned) or {}
+            
+            if ad_obj.get("category_id") != cat_id or not ad_obj.get("title") or not ad_obj.get("description"):
+                ad_obj = {
+                    "title": f"{cat_name} – guter Zustand",
+                    "description": "Privatverkauf. Abholung nach Absprache. Keine Garantie.",
+                    "price": random.randint(MIN_PRICE, MAX_PRICE),
+                    "brand": "Generic",
+                    "category_id": cat_id,
+                }
 
-    # 5) Формируем payload как в твоём рабочем скрипте
-    payload = {
-        "title": ad_obj["title"],
-        "description": ad_obj["description"],
-        "categoryId": str(ad_obj["category_id"]),
-        "adAddress": "",
-        "priceType": "SPECIFIED_AMOUNT",
-        "postcode": random_german_postcode(),
-        "contact": "",
-        "imprint": "",
-        "amount": int(ad_obj["price"]),        # ВАЖНО: amount, не price
-        "adType": "",
-        "attributes": attrs,
-        "shippingOptions": ["DHL_001", "HERMES_001"],
-        "images": [],
-        "id": "",
-        "handshake": 1,
-        "threatmetrix": True,
-        "account": email,                      # ВАЖНО: account = email
-    }
+            # Атрибуты
+            attrs_ai = build_attributes_payload(ad_obj, schema) if schema else {}
+            if not isinstance(attrs_ai, dict):
+                attrs_ai = {}
+            attrs = fill_required_attributes(schema, attrs_ai)
 
-    # 6) Публикация
-    try:
-        logger.info(f"[QuickPost] POST {SUITEPRO_CLASSIFIEDS_URL}")
-        r = _req_with_retry("POST", SUITEPRO_CLASSIFIEDS_URL, headers=HEADERS_SUITE, json=payload)
-        resp = r.json() if r.text else {}
-        logger.info(f"[QuickPost] created: status={r.status_code} resp={str(resp)[:500]}")
-    except Exception as e:
-        logger.error(f"[QuickPost] create error: {e}")
-        await message.answer("Не удалось опубликовать объявление (см. логи).")
-        return
+            # Payload
+            payload = {
+                "title": ad_obj["title"],
+                "description": ad_obj["description"],
+                "categoryId": str(ad_obj["category_id"]),
+                "adAddress": "",
+                "priceType": "SPECIFIED_AMOUNT",
+                "postcode": random_german_postcode(),
+                "contact": "",
+                "imprint": "",
+                "amount": int(ad_obj["price"]),
+                "adType": "",
+                "attributes": attrs,
+                "shippingOptions": ["DHL_001", "HERMES_001"],
+                "images": [],
+                "id": "",
+                "handshake": 1,
+                "threatmetrix": True,
+                "account": email,
+            }
 
-    await message.answer(
-        "✅ Опубликовал быстрый пост:\n"
-        f"• Аккаунт: {email}\n"
-        f"• Категория: {cat_name}\n"
-        f"• Заголовок: {ad_obj['title']}\n"
-        f"• Цена: {ad_obj['price']} €"
+            # Публикация
+            logger.info(f"[QuickPost] {idx}/{len(candidates)} POST for {email}")
+            r = _req_with_retry("POST", SUITEPRO_CLASSIFIEDS_URL, headers=HEADERS_SUITE, json=payload)
+            resp = r.json() if r.text else {}
+            
+            if r.status_code in (200, 201):
+                ad_id = None
+                
+                # Пытаемся извлечь ID объявления из ответа
+                if isinstance(resp, dict):
+                    ad_id = resp.get("id") or resp.get("adId") or resp.get("ad_id")
+                
+                # Резервируем объявление если получили ID
+                reserved = False
+                if ad_id:
+                    reserved = reserve_ad(email, str(ad_id))
+                    if reserved:
+                        results.append(f"✅ {email}: {ad_obj['title']} 🔒")
+                        logger.info(f"[QuickPost] ✅ {email} published & reserved")
+                    else:
+                        results.append(f"✅ {email}: {ad_obj['title']} ⚠️ резервация не удалась")
+                        logger.warning(f"[QuickPost] ✅ {email} published but reserve failed")
+                else:
+                    results.append(f"✅ {email}: {ad_obj['title']} ⚠️ нет ID")
+                    logger.warning(f"[QuickPost] ✅ {email} published but no ad ID in response")
+                
+                success_count += 1
+            else:
+                fail_count += 1
+                results.append(f"❌ {email}: HTTP {r.status_code}")
+                logger.warning(f"[QuickPost] ❌ {email} failed: {r.status_code}")
+            
+            # Небольшая задержка между публикациями
+            if idx < len(candidates):
+                time.sleep(random.uniform(2, 4))
+        
+        except Exception as e:
+            fail_count += 1
+            results.append(f"❌ {email}: {str(e)[:50]}")
+            logger.error(f"[QuickPost] error for {email}: {e}")
+            continue
+
+    # 4) Итоговый отчёт
+    report = (
+        f"📊 <b>ПУБЛИКАЦИЯ ЗАВЕРШЕНА!</b>\n\n"
+        f"✅ Успешно: <b>{success_count}</b>\n"
+        f"❌ Ошибки: <b>{fail_count}</b>\n"
+        f"📝 Всего: <b>{len(candidates)}</b>\n\n"
+        f"<b>Детали:</b>\n"
     )
+    
+    # Добавляем детали (максимум 20 строк чтобы не переполнить)
+    for line in results[:20]:
+        report += f"{line}\n"
+    
+    if len(results) > 20:
+        report += f"\n... и ещё {len(results) - 20} аккаунтов"
+    
+    await message.answer(report)
+

@@ -35,7 +35,13 @@ def _format_account(idx: int, acc: Dict) -> str:
         f"• {created}"
     )
 
-def _kb(accounts: List[Dict], page: int, total: Optional[int], has_more: bool) -> InlineKeyboardMarkup:
+def _kb(
+    accounts: List[Dict], 
+    page: int, 
+    total: Optional[int], 
+    has_more: bool,
+    sort_mode: str = "date"  # "date" или "ads"
+) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
 
     row: List[InlineKeyboardButton] = []
@@ -48,6 +54,7 @@ def _kb(accounts: List[Dict], page: int, total: Optional[int], has_more: bool) -
     if row:
         rows.append(row)
 
+    # Навигация
     nav: List[InlineKeyboardButton] = []
     has_prev = page > 0
     if total is not None and isinstance(total, int):
@@ -57,20 +64,67 @@ def _kb(accounts: List[Dict], page: int, total: Optional[int], has_more: bool) -
         has_next = has_more
 
     if has_prev:
-        nav.append(InlineKeyboardButton(text="⟨ Назад", callback_data=f"accs:page:{page-1}"))
-    nav.append(InlineKeyboardButton(text="🔁 Обновить", callback_data=f"accs:refresh:{page}"))
+        nav.append(InlineKeyboardButton(text="⟨ Назад", callback_data=f"accs:page:{page-1}:{sort_mode}"))
+    nav.append(InlineKeyboardButton(text="🔁 Обновить", callback_data=f"accs:refresh:{page}:{sort_mode}"))
     if has_next:
-        nav.append(InlineKeyboardButton(text="Вперёд ⟩", callback_data=f"accs:page:{page+1}"))
+        nav.append(InlineKeyboardButton(text="Вперёд ⟩", callback_data=f"accs:page:{page+1}:{sort_mode}"))
     if nav:
         rows.append(nav)
 
+    # Кнопки сортировки
+    sort_row: List[InlineKeyboardButton] = []
+    
+    if sort_mode == "date":
+        # Текущая сортировка по дате - показываем активную кнопку
+        sort_row.append(InlineKeyboardButton(
+            text="📅 По дате ✓", 
+            callback_data="accs:none"
+        ))
+        sort_row.append(InlineKeyboardButton(
+            text="📊 По кол-ву объявлений", 
+            callback_data=f"accs:sort:ads:{page}"
+        ))
+    else:
+        # Текущая сортировка по объявлениям
+        sort_row.append(InlineKeyboardButton(
+            text="📅 По дате", 
+            callback_data=f"accs:sort:date:{page}"
+        ))
+        sort_row.append(InlineKeyboardButton(
+            text="📊 По кол-ву объявлений ✓", 
+            callback_data="accs:none"
+        ))
+    
+    rows.append(sort_row)
     rows.append([InlineKeyboardButton(text="Назад в меню", callback_data="accs:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def _render_page_msg(message: Message, page: int, *, edit_message: Message | None = None) -> None:
+async def _render_page_msg(
+    message: Message, 
+    page: int, 
+    sort_mode: str = "date",  # "date" или "ads"
+    *, 
+    edit_message: Message | None = None
+) -> None:
     limit = PAGE_SIZE
     cursor = page * limit
-    status, resp = await svc_list_accounts(cursor=cursor, limit=limit)
+    
+    # Определяем параметры сортировки
+    if sort_mode == "ads":
+        sort_by = "adsCount"
+        sort_order = "desc"  # От большего к меньшему
+        sort_label = "по количеству объявлений (больше → меньше)"
+    else:
+        sort_by = "creationDate"
+        sort_order = "asc"  # От старых к новым
+        sort_label = "по дате создания (старые → новые)"
+    
+    status, resp = await svc_list_accounts(
+        cursor=cursor, 
+        limit=limit,
+        sort_by=sort_by,
+        sort_order=sort_order
+    )
 
     if status == 200 and isinstance(resp, dict):
         accounts = resp.get("accounts") or []
@@ -78,14 +132,20 @@ async def _render_page_msg(message: Message, page: int, *, edit_message: Message
         logged_in = resp.get("loggedInCount", "-")
         has_more = bool(resp.get("hasMore"))
 
-        header = f"Список аккаунтов (всего: {total if total is not None else '-'}, залогинены: {logged_in}):"
+        header = f"Список аккаунтов (всего: {total if total is not None else '-'}, залогинены: {logged_in}):\n"
+        header += f"🔄 Сортировка: {sort_label}"
         lines = [header] + [_format_account(i, acc) for i, acc in enumerate(accounts, start=1 + cursor)]
         text = "\n".join(lines)
 
-        kb = _kb(accounts, page, total if isinstance(total, int) else None, has_more)
+        kb = _kb(accounts, page, total if isinstance(total, int) else None, has_more, sort_mode)
 
         if edit_message:
-            await edit_message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+            try:
+                await edit_message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+            except Exception as e:
+                # Игнорируем ошибку "message is not modified"
+                if "message is not modified" not in str(e).lower():
+                    raise
         else:
             await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
         return
@@ -99,26 +159,49 @@ async def _render_page_msg(message: Message, page: int, *, edit_message: Message
 @router.message(F.text.in_({"👥 Список аккаунтов", "Список аккаунтов"}))
 async def list_accounts_open(message: Message) -> None:
     loading = await message.answer("Загружаю список…")
-    await _render_page_msg(message, page=0, edit_message=loading)
+    await _render_page_msg(message, page=0, sort_mode="date", edit_message=loading)
 
 @router.callback_query(F.data.startswith("accs:page:"))
 async def list_accounts_page(call: CallbackQuery) -> None:
     try:
-        page = int(call.data.split(":")[-1])
+        parts = call.data.split(":")
+        page = int(parts[2])
+        sort_mode = parts[3] if len(parts) > 3 else "date"
     except Exception:
         await call.answer()
         return
-    await _render_page_msg(call.message, page=page, edit_message=call.message)
+    await _render_page_msg(call.message, page=page, sort_mode=sort_mode, edit_message=call.message)
     await call.answer()
 
 @router.callback_query(F.data.startswith("accs:refresh:"))
 async def list_accounts_refresh(call: CallbackQuery) -> None:
     try:
-        page = int(call.data.split(":")[-1])
+        parts = call.data.split(":")
+        page = int(parts[2])
+        sort_mode = parts[3] if len(parts) > 3 else "date"
     except Exception:
         page = 0
-    await _render_page_msg(call.message, page=page, edit_message=call.message)
+        sort_mode = "date"
+    await _render_page_msg(call.message, page=page, sort_mode=sort_mode, edit_message=call.message)
     await call.answer("Обновил")
+
+@router.callback_query(F.data.startswith("accs:sort:"))
+async def list_accounts_sort(call: CallbackQuery) -> None:
+    """Обработчик смены сортировки"""
+    try:
+        parts = call.data.split(":")
+        new_sort = parts[2]  # "date" или "ads"
+        page = int(parts[3]) if len(parts) > 3 else 0
+    except Exception:
+        await call.answer()
+        return
+    
+    # Показываем уведомление
+    sort_name = "по дате создания" if new_sort == "date" else "по количеству объявлений"
+    await call.answer(f"🔄 Сортировка: {sort_name}")
+    
+    # Рендерим страницу с новой сортировкой
+    await _render_page_msg(call.message, page=page, sort_mode=new_sort, edit_message=call.message)
 
 @router.callback_query(F.data == "accs:none")
 async def list_accounts_noop(call: CallbackQuery) -> None:
