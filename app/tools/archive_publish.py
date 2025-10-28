@@ -74,6 +74,55 @@ WHITELIST_CATEGORIES: Dict[int, str] = {
     74:  "Musikinstrumente",
 }
 
+# Глобальный кэш для metadata категорий
+_METADATA_CACHE: Dict[str, Dict] = {}
+_METADATA_CACHE_LOADED = False
+
+
+def _clean_description(desc: str) -> str:
+    """
+    Очищает описание от запрещённых элементов:
+    1. Убирает даты из "Rechnung" (заменяет на "Rechnung vorhanden")
+    2. Убирает упоминания PayPal
+    3. Убирает "nur Abholung"
+    """
+    # 1. Заменяем "Rechnung" с датой на "Rechnung vorhanden"
+    desc = re.sub(
+        r'Rechnung\s+(vom?|von)\s+\d{1,2}[\./ ]\d{1,2}[\./ ]\d{2,4}',
+        'Rechnung vorhanden',
+        desc,
+        flags=re.IGNORECASE
+    )
+    desc = re.sub(
+        r'Rechnung\s+\d{1,2}[\./ ]\d{1,2}[\./ ]\d{2,4}',
+        'Rechnung vorhanden',
+        desc,
+        flags=re.IGNORECASE
+    )
+    
+    # 2. Убираем упоминания PayPal
+    desc = re.sub(
+        r'\b(PayPal|Paypal)\s*(Friends?|Familie|Freunde)?\b',
+        '',
+        desc,
+        flags=re.IGNORECASE
+    )
+    
+    # 3. Убираем "nur Abholung"
+    desc = re.sub(
+        r'\b[Nn]ur\s+[Aa]bholung\b',
+        'Abholung möglich',
+        desc
+    )
+    
+    # Убираем двойные пробелы и лишние запятые
+    desc = re.sub(r'\s+', ' ', desc)
+    desc = re.sub(r',\s*,', ',', desc)
+    desc = re.sub(r'\s+\.', '.', desc)
+    desc = re.sub(r'\s+,', ',', desc)
+    
+    return desc.strip()
+
 def _whitelist_leaves() -> List[Dict]:
     """Приводим WHITELIST_CATEGORIES к виду [{id,name,path}]"""
     return [{"id": str(cid), "name": name, "path": name} for cid, name in WHITELIST_CATEGORIES.items()]
@@ -84,6 +133,61 @@ def _cat_name_by_id(leaves: List[Dict], cid: str) -> str:
         if str(c.get("id")) == cid:
             return c.get("path") or c.get("name") or ""
     return ""
+
+async def _load_categories_metadata() -> Dict[str, Dict]:
+    """
+    Загружает metadata для всех категорий из whitelist и кэширует.
+    Возвращает dict: {category_id: metadata}
+    """
+    global _METADATA_CACHE, _METADATA_CACHE_LOADED
+    
+    # Если уже загружено, возвращаем кэш
+    if _METADATA_CACHE_LOADED and _METADATA_CACHE:
+        return _METADATA_CACHE
+    
+    log.info("[METADATA-CACHE] Loading metadata for all whitelist categories...")
+    
+    for cat_id, cat_name in WHITELIST_CATEGORIES.items():
+        try:
+            ok, meta_payload, status = await sp_get_category_metadata(str(cat_id))
+            if ok and isinstance(meta_payload, dict):
+                # Извлекаем только ключевые атрибуты для GPT
+                schema = _extract_attribute_schema(meta_payload)
+                
+                # Фильтруем атрибуты - берём только важные
+                key_attrs = []
+                for attr in schema:
+                    attr_name = attr.get("name", "")
+                    # Берём только: art, type, condition, material
+                    if any(x in attr_name.lower() for x in [".art", ".type", ".condition", ".material"]):
+                        options = attr.get("options", [])
+                        if options:
+                            # Извлекаем только values
+                            if isinstance(options[0], dict):
+                                opt_values = [o.get("value") for o in options if o.get("value")]
+                            else:
+                                opt_values = options
+                            
+                            key_attrs.append({
+                                "name": attr_name,
+                                "options": opt_values[:20]  # Ограничиваем до 20 опций
+                            })
+                
+                _METADATA_CACHE[str(cat_id)] = {
+                    "id": str(cat_id),
+                    "name": cat_name,
+                    "attributes": key_attrs
+                }
+                log.info(f"[METADATA-CACHE] Loaded {cat_id}: {cat_name} ({len(key_attrs)} attrs)")
+            else:
+                log.warning(f"[METADATA-CACHE] Failed to load {cat_id}: {cat_name}")
+        except Exception as e:
+            log.warning(f"[METADATA-CACHE] Error loading {cat_id}: {e}")
+    
+    _METADATA_CACHE_LOADED = True
+    log.info(f"[METADATA-CACHE] Loaded {len(_METADATA_CACHE)} categories")
+    
+    return _METADATA_CACHE
 
 # ====== временное хранилище токенов callback ======
 _TOKEN_TTL = 15 * 60
@@ -147,82 +251,30 @@ class TgStatus:
 
 # ====== утилиты чтения архива ======
 def _read_info(zip_path: str) -> Tuple[str, str, str, str, str]:
-    """
-    Читает информацию из архива.
-    Поддерживает два формата:
-    
-    1. info.txt (от граббера):
-       Title: ...
-       Price: ...
-       URL: ...
-       Saved at: ...
-       Description:
-       ...
-    
-    2. output.txt (ручной):
-       Заголовок: ...
-       Цена: ...
-       Описание: ...
-    
-    Возвращает: (title, price, url, saved, desc)
-    """
     title = price = url = saved = desc = ""
-    
     try:
         with ZipFile(zip_path, "r") as z:
-            # Ищем info.txt или output.txt
-            info_file = None
-            output_file = None
-            
+            name = None
             for zi in z.infolist():
-                if zi.is_dir():
-                    continue
-                # Проверяем имя файла (без пути) для поддержки файлов в подпапках
-                fname_lower = zi.filename.lower()
-                basename_lower = zi.filename.split('/')[-1].lower()
-                
-                if basename_lower == "info.txt":
-                    info_file = zi.filename
-                elif basename_lower == "output.txt":
-                    output_file = zi.filename
-            
-            # Приоритет: info.txt, затем output.txt
-            target_file = info_file or output_file
-            if not target_file:
+                if not zi.is_dir() and zi.filename.lower().endswith("info.txt"):
+                    name = zi.filename
+                    break
+            if not name:
                 return title, price, url, saved, desc
-            
-            text = z.read(target_file).decode("utf-8", errors="ignore")
-            
-            # Парсинг в зависимости от формата
-            if target_file == info_file:
-                # Формат info.txt (от граббера)
-                m_title = re.search(r"^Title:\s*(.+)$", text, re.M)
-                m_price = re.search(r"^Price:\s*(.+)$", text, re.M)
-                m_url = re.search(r"^URL:\s*(.+)$", text, re.M)
-                m_saved = re.search(r"^Saved at:\s*(.+)$", text, re.M)
-                m_desc = re.search(r"^Description:\s*\n([\s\S]+)$", text, re.M)
-                
-                title = (m_title.group(1).strip() if m_title else "")
-                price = (m_price.group(1).strip() if m_price else "")
-                url = (m_url.group(1).strip() if m_url else "")
-                saved = (m_saved.group(1).strip() if m_saved else "")
-                desc = (m_desc.group(1).strip() if m_desc else "")
-            else:
-                # Формат output.txt (ручной)
-                m_title = re.search(r"^Заголовок:\s*(.+)$", text, re.M)
-                m_price = re.search(r"^Цена:\s*(.+)$", text, re.M)
-                m_desc = re.search(r"^Описание:\s*(.+?)(?:^[А-ЯA-Z]|\Z)", text, re.M | re.S)
-                
-                title = (m_title.group(1).strip() if m_title else "")
-                price = (m_price.group(1).strip() if m_price else "")
-                desc = (m_desc.group(1).strip() if m_desc else "")
-                # URL и saved не заполняются для output.txt
-                
+            text = z.read(name).decode("utf-8", errors="ignore")
+            m = re.search(r"^Title:\s*(.+)$", text, re.M)
+            title = (m.group(1).strip() if m else "")
+            m = re.search(r"^Price:\s*(.+)$", text, re.M)
+            price = (m.group(1).strip() if m else "")
+            m = re.search(r"^URL:\s*(.+)$", text, re.M)
+            url = (m.group(1).strip() if m else "")
+            m = re.search(r"^Saved at:\s*(.+)$", text, re.M)
+            saved = (m.group(1).strip() if m else "")
+            m = re.search(r"^Description:\s*\n([\s\S]+)$", text, re.M)
+            desc = (m.group(1).strip() if m else "")
     except Exception as e:
-        log.warning(f"Failed to read archive info from {zip_path}: {e}")
-    
+        log.warning("read info.txt failed: %s", e)
     return title, price, url, saved, desc
-
 
 def _extract_images(zip_path: str, max_images: int = 10) -> List[Tuple[str, bytes]]:
     exts = (".jpg", ".jpeg", ".png", ".gif", ".webp")
@@ -407,7 +459,7 @@ def _extract_attribute_schema(meta_payload: dict) -> list[dict]:
     return schema
 
 # ====== GPT-заполнение по вайт-листу ======
-def _gpt_fill_ad(info: Dict, leaves: List[Dict]) -> Dict:
+def _gpt_fill_ad(info: Dict, leaves: List[Dict], categories_with_meta: Dict[str, Dict] = None) -> Dict:
     """
     Просим вернуть JSON:
     {
@@ -422,12 +474,22 @@ def _gpt_fill_ad(info: Dict, leaves: List[Dict]) -> Dict:
     """
     if not (settings.OPENAI_API_KEY or "").strip():
         return {}
-    cats_compact = [{"id": c["id"], "name": c["name"], "path": c["path"]} for c in leaves][:1000]
+    # Используем категории с metadata если есть, иначе простой список
+    if categories_with_meta:
+        cats_compact = list(categories_with_meta.values())
+    else:
+        cats_compact = [{"id": c["id"], "name": c["name"], "path": c["path"]} for c in leaves][:1000]
     sys = (
         "Ты помощник по заполнению объявлений. Отвечай ТОЛЬКО JSON. "
         "category_id обязан быть одним из переданных id. Не используй категории вне списка. "
         "postcode выбери для небольшого города Германии (например: 88131, 78176, 25980). "
         "Добавь поле reason с кратким объяснением выбора категории (по-немецки). "
+        "\n\n"
+        "РАБОТА С АТРИБУТАМИ:\n"
+        "- Каждая категория имеет поле 'attributes' со списком доступных атрибутов.\n"
+        "- Ты ОБЯЗАН заполнить поле 'attributes' в ответе с правильными значениями из списка options.\n"
+        "- Формат: {'attribute_name': 'value'}, например: {'elektronik.art': 'netzwerk_modem'}\n"
+        "- ВСЕГДА выбирай наиболее подходящее значение для атрибута 'art' или 'type'.\n"
         "\n\n"
         "ВАЖНЫЕ ПРАВИЛА ДЛЯ DESCRIPTION:\n"
         "1. Удали любые упоминания 'Abholung' или 'nur Abholung' - не пиши об этом вообще.\n"
@@ -793,10 +855,15 @@ async def publish_from_archive_with_price(
     title = (title0 or "Kleinanzeige").strip()
     description = (desc0 or url0 or "Privatverkauf.").strip()
     
+    # Очищаем описание от запрещённых элементов
+    description = _clean_description(description)
     log.info(f"[ARCHIVE-PUBLISH] Using title='{title}', desc_len={len(description)}, price={custom_price}")
+    log.info(f"[CLEAN-DESC] Cleaned description")
     
     # GPT используем ТОЛЬКО для выбора категории (если нужно)
-    gpt = _gpt_fill_ad(info, leaves) if (settings.OPENAI_API_KEY or "").strip() else {}
+    # Загружаем metadata для всех категорий
+    categories_with_meta = await _load_categories_metadata() if (settings.OPENAI_API_KEY or "").strip() else {}
+    gpt = _gpt_fill_ad(info, leaves, categories_with_meta) if (settings.OPENAI_API_KEY or "").strip() else {}
 
     def _is_valid_cid(cid: str) -> bool:
         return any(c["id"] == cid for c in leaves)
